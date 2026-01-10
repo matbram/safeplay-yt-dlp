@@ -14,12 +14,69 @@ This service is responsible for:
 
 ## Tech Stack
 
-- **Runtime:** Python 3.11+
+- **Runtime:** Python 3.12+
 - **Framework:** FastAPI
 - **Download:** yt-dlp
 - **Proxy:** OxyLabs Residential Proxies
 - **Storage:** Supabase Storage
-- **Deployment:** Railway
+- **Deployment:** Digital Ocean Droplet (Ubuntu 24.04 LTS)
+
+## Quick Deploy (Digital Ocean)
+
+### One-Line Install
+
+SSH into your Ubuntu 24.04 droplet and run:
+
+```bash
+curl -sSL https://raw.githubusercontent.com/matbram/safeplay-yt-dlp/main/deploy/install.sh | sudo bash
+```
+
+### What the Installer Does
+
+1. Installs system dependencies (Python 3.12, ffmpeg, yt-dlp)
+2. Creates a dedicated `safeplay` user
+3. Clones this repository
+4. Sets up Python virtual environment
+5. Configures systemd service with auto-restart
+6. Sets up self-healing health checks (every 2 minutes)
+7. Configures UFW firewall and fail2ban
+8. Sets up log rotation
+9. Creates diagnostic tools
+
+### Self-Healing Features
+
+- **Health monitoring:** Checks service every 2 minutes
+- **Auto-restart:** Service restarts on failure
+- **Temp cleanup:** Old downloads cleaned automatically
+- **Auto-update:** Weekly checks for updates
+- **yt-dlp updates:** Daily updates to latest version
+
+### Management Commands
+
+After installation, use these commands:
+
+```bash
+# Check service status
+safeplay-status
+
+# View logs
+safeplay-logs app     # Application logs
+safeplay-logs error   # Error logs
+safeplay-logs health  # Health check logs
+safeplay-logs all     # All logs
+
+# Restart service
+safeplay-restart
+
+# Manual update
+safeplay-update
+```
+
+### Uninstall
+
+```bash
+curl -sSL https://raw.githubusercontent.com/matbram/safeplay-yt-dlp/main/deploy/uninstall.sh | sudo bash
+```
 
 ## API Endpoints
 
@@ -79,7 +136,7 @@ Health check endpoint.
   "checks": {
     "ytdlp": "available",
     "supabase": "connected",
-    "proxy": "reachable"
+    "proxy": "configured"
   }
 }
 ```
@@ -99,17 +156,25 @@ Health check endpoint.
 
 ## Local Development
 
-1. Clone the repository
+1. Clone the repository:
+   ```bash
+   git clone https://github.com/matbram/safeplay-yt-dlp.git
+   cd safeplay-yt-dlp
+   ```
+
 2. Create a virtual environment:
    ```bash
-   python -m venv venv
+   python3 -m venv venv
    source venv/bin/activate
    ```
+
 3. Install dependencies:
    ```bash
    pip install -r requirements.txt
    ```
+
 4. Copy `.env.example` to `.env` and fill in values
+
 5. Run the server:
    ```bash
    uvicorn app.main:app --reload --port 3002
@@ -135,11 +200,12 @@ curl http://localhost:3002/api/download/test-job-123/status \
   -H "X-API-Key: your-internal-api-key"
 ```
 
-## Deployment
+## Security Considerations
 
-This service is deployed on Railway using the included `railway.json` configuration.
-
-**Important:** This service should NOT have a public domain. Only the Orchestration Service calls it via Railway internal networking.
+1. **Network Security:** Use Digital Ocean's VPC/private networking between this service and the Orchestration Service
+2. **Firewall:** UFW is configured to only allow SSH and port 3002
+3. **API Key:** Use a strong, random API key (auto-generated during install)
+4. **fail2ban:** Protects against brute force attacks
 
 ## Error Codes
 
@@ -157,7 +223,15 @@ This service is deployed on Railway using the included `railway.json` configurat
 - **No audio extraction needed:** ElevenLabs accepts video files directly via `cloud_storage_url`
 - **Proxy rotation:** OxyLabs automatically rotates IPs for each request
 - **Temp file cleanup:** Files are automatically cleaned up after upload
-- **Progress tracking:** In-memory progress tracking (consider Redis for production scale)
+- **Progress tracking:** In-memory progress tracking
+
+## Recommended Droplet Specs
+
+| Tier | Specs | Videos/Day |
+|------|-------|------------|
+| Basic | 1 vCPU, 1GB RAM | ~50 |
+| Standard | 2 vCPU, 2GB RAM | ~200 |
+| Performance | 4 vCPU, 8GB RAM | ~500+ |
 
 ## License
 
