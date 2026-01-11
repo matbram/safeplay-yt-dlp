@@ -1,7 +1,9 @@
 """Supabase storage operations for video uploads."""
 
+import asyncio
 import aiofiles
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Optional
 
@@ -16,6 +18,9 @@ supabase: Client = create_client(
     settings.SUPABASE_URL,
     settings.SUPABASE_SERVICE_KEY
 )
+
+# Thread pool for uploads (separate from download pool for true parallelism)
+_upload_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="upload")
 
 logger.info("Supabase storage client initialized", "storage")
 
@@ -72,19 +77,24 @@ async def upload_to_supabase(
         }
         content_type = content_types.get(file_ext.lower(), "video/mp4")
 
-        # Upload to Supabase Storage
+        # Upload to Supabase Storage (run in thread pool for parallel execution)
         logger.info(
             f"Uploading to Supabase bucket '{settings.STORAGE_BUCKET}'...",
             "storage",
             {"job_id": job_id, "bucket": settings.STORAGE_BUCKET, "path": storage_path, "content_type": content_type}
         )
 
+        def _blocking_upload():
+            """Run the blocking Supabase upload in a thread."""
+            supabase.storage.from_(settings.STORAGE_BUCKET).upload(
+                path=storage_path,
+                file=file_content,
+                file_options={"content-type": content_type, "upsert": "true"}
+            )
+
         upload_start = time.time()
-        supabase.storage.from_(settings.STORAGE_BUCKET).upload(
-            path=storage_path,
-            file=file_content,
-            file_options={"content-type": content_type, "upsert": "true"}
-        )
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(_upload_executor, _blocking_upload)
         upload_time = time.time() - upload_start
 
         logger.success(

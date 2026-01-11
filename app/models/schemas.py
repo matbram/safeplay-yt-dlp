@@ -1,5 +1,5 @@
 from pydantic import BaseModel, Field
-from typing import Optional
+from typing import Optional, List
 from datetime import datetime
 
 
@@ -61,3 +61,48 @@ class VideoInfo(BaseModel):
     duration_seconds: int
     filesize_bytes: Optional[int] = None
     ext: str = "mp4"
+
+
+class BatchDownloadItem(BaseModel):
+    """Single item in a batch download request."""
+
+    youtube_id: str = Field(
+        ...,
+        min_length=11,
+        max_length=11,
+        description="YouTube video ID (11 characters)",
+    )
+    job_id: str = Field(..., description="Job ID for tracking progress")
+
+
+class BatchDownloadRequest(BaseModel):
+    """Request model for batch video downloads."""
+
+    videos: List[BatchDownloadItem] = Field(
+        ...,
+        min_length=1,
+        max_length=20,
+        description="List of videos to download (max 20)",
+    )
+
+
+class BatchDownloadResultItem(BaseModel):
+    """Result for a single video in batch download."""
+
+    youtube_id: str
+    job_id: str
+    status: str  # success, failed, cached
+    storage_path: Optional[str] = None
+    error: Optional[str] = None
+    cached: bool = False
+
+
+class BatchDownloadResponse(BaseModel):
+    """Response model for batch download."""
+
+    status: str = "completed"
+    total: int
+    succeeded: int
+    failed: int
+    cached: int
+    results: List[BatchDownloadResultItem]

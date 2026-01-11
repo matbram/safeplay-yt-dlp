@@ -21,8 +21,8 @@ from app.utils.exceptions import (
     DownloadError,
 )
 
-# Thread pool for running blocking downloads
-_download_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="ytdlp")
+# Thread pool for running blocking downloads (8 workers for parallel capacity)
+_download_executor = ThreadPoolExecutor(max_workers=8, thread_name_prefix="ytdlp")
 
 
 def _check_aria2c_available() -> bool:

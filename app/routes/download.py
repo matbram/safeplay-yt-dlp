@@ -1,8 +1,15 @@
 """Download endpoint for YouTube videos."""
 
+import asyncio
 from fastapi import APIRouter, HTTPException, Depends, BackgroundTasks
 
-from app.models.schemas import DownloadRequest, DownloadResponse
+from app.models.schemas import (
+    DownloadRequest,
+    DownloadResponse,
+    BatchDownloadRequest,
+    BatchDownloadResponse,
+    BatchDownloadResultItem,
+)
 from app.services import youtube, storage, logger
 from app.middleware.auth import verify_api_key
 from app.utils.exceptions import SafePlayError
@@ -184,3 +191,136 @@ async def download_video_endpoint(
                 "message": error_msg,
             }
         )
+
+
+async def _process_single_video(
+    youtube_id: str,
+    job_id: str,
+) -> BatchDownloadResultItem:
+    """
+    Process a single video download for batch operations.
+    Returns a result item instead of raising exceptions.
+    """
+    try:
+        # Check cache first
+        cache_result = await storage.check_video_cache(youtube_id)
+        if cache_result.get("exists"):
+            youtube.update_job_progress(job_id, "completed", 100)
+            return BatchDownloadResultItem(
+                youtube_id=youtube_id,
+                job_id=job_id,
+                status="success",
+                storage_path=cache_result["storage_path"],
+                cached=True,
+            )
+
+        # Download the video
+        result = await youtube.download_video(
+            youtube_id=youtube_id,
+            job_id=job_id,
+        )
+
+        if not result.get("success"):
+            return BatchDownloadResultItem(
+                youtube_id=youtube_id,
+                job_id=job_id,
+                status="failed",
+                error=result.get("error", "Download failed"),
+            )
+
+        # Upload to Supabase Storage
+        youtube.update_job_progress(job_id, "uploading", 80)
+        upload_result = await storage.upload_to_supabase(
+            local_file_path=result["file_path"],
+            youtube_id=youtube_id,
+            job_id=job_id,
+        )
+
+        if not upload_result.get("success"):
+            return BatchDownloadResultItem(
+                youtube_id=youtube_id,
+                job_id=job_id,
+                status="failed",
+                error=upload_result.get("error", "Upload failed"),
+            )
+
+        youtube.update_job_progress(job_id, "completed", 100)
+
+        # Schedule cleanup
+        youtube.cleanup_temp_files(job_id)
+
+        return BatchDownloadResultItem(
+            youtube_id=youtube_id,
+            job_id=job_id,
+            status="success",
+            storage_path=upload_result["storage_path"],
+        )
+
+    except Exception as e:
+        youtube.update_job_progress(job_id, "failed", 0, str(e))
+        return BatchDownloadResultItem(
+            youtube_id=youtube_id,
+            job_id=job_id,
+            status="failed",
+            error=str(e),
+        )
+
+
+@router.post(
+    "/api/download/batch",
+    response_model=BatchDownloadResponse,
+    responses={
+        400: {"description": "Invalid request"},
+        401: {"description": "Invalid API key"},
+    },
+)
+async def batch_download_endpoint(
+    request: BatchDownloadRequest,
+    api_key: str = Depends(verify_api_key),
+) -> BatchDownloadResponse:
+    """
+    Download multiple YouTube videos in parallel.
+
+    All videos are processed concurrently using separate thread pools
+    for downloads (8 workers) and uploads (4 workers).
+
+    Args:
+        request: Batch download request with list of videos (max 20)
+
+    Returns:
+        BatchDownloadResponse with results for each video
+    """
+    logger.info(
+        f"Batch download request received: {len(request.videos)} videos",
+        "download",
+        {"video_count": len(request.videos)}
+    )
+
+    # Create tasks for all videos
+    tasks = [
+        _process_single_video(video.youtube_id, video.job_id)
+        for video in request.videos
+    ]
+
+    # Run all downloads in parallel
+    results = await asyncio.gather(*tasks)
+
+    # Count results
+    succeeded = sum(1 for r in results if r.status == "success" and not r.cached)
+    failed = sum(1 for r in results if r.status == "failed")
+    cached = sum(1 for r in results if r.cached)
+
+    logger.success(
+        f"Batch download complete: {succeeded} succeeded, {cached} cached, {failed} failed",
+        "download",
+        {"succeeded": succeeded, "cached": cached, "failed": failed}
+    )
+
+    return BatchDownloadResponse(
+        status="completed",
+        total=len(results),
+        succeeded=succeeded,
+        failed=failed,
+        cached=cached,
+        results=results,
+    )
