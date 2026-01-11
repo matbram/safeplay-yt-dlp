@@ -1,10 +1,12 @@
 """YouTube video download service using yt-dlp with verbose logging and speed optimizations."""
 
+import asyncio
 import shutil
 import subprocess
 import time
 from pathlib import Path
 from typing import Optional
+from concurrent.futures import ThreadPoolExecutor
 
 import yt_dlp
 
@@ -18,6 +20,9 @@ from app.utils.exceptions import (
     CopyrightBlockedError,
     DownloadError,
 )
+
+# Thread pool for running blocking downloads
+_download_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="ytdlp")
 
 
 def _check_aria2c_available() -> bool:
@@ -166,7 +171,9 @@ async def download_video(youtube_id: str, job_id: str) -> dict:
 
     start_time = time.time()
 
-    try:
+    # Define blocking download function to run in thread
+    def _blocking_download():
+        """Run the blocking yt-dlp download in a separate thread."""
         logger.info("Initializing yt-dlp...", "ytdlp", {"job_id": job_id, "options": {
             "format": ydl_opts["format"],
             "retries": ydl_opts["retries"],
@@ -186,34 +193,54 @@ async def download_video(youtube_id: str, job_id: str) -> dict:
             filesize = output_file.stat().st_size if output_file.exists() else 0
             duration = time.time() - start_time
 
-            result = {
-                "success": True,
-                "file_path": str(output_file),
-                "title": info.get("title", "Unknown"),
-                "duration_seconds": info.get("duration", 0),
-                "youtube_id": youtube_id,
+            return {
+                "info": info,
                 "ext": ext,
-                "filesize_bytes": filesize,
+                "output_file": output_file,
+                "filesize": filesize,
+                "duration": duration,
             }
 
-            logger.success(
-                f"Download complete: {info.get('title', 'Unknown')}",
-                "download",
-                {
-                    "job_id": job_id,
-                    "youtube_id": youtube_id,
-                    "title": info.get("title"),
-                    "duration_seconds": info.get("duration"),
-                    "filesize_bytes": filesize,
-                    "filesize_mb": round(filesize / (1024 * 1024), 2),
-                    "download_time_seconds": round(duration, 2),
-                    "format": info.get("format"),
-                    "resolution": info.get("resolution"),
-                    "ext": ext,
-                }
-            )
+    try:
+        # Run blocking download in thread pool to not block event loop
+        # This allows WebSocket to send real-time log updates
+        loop = asyncio.get_event_loop()
+        download_result = await loop.run_in_executor(_download_executor, _blocking_download)
 
-            return result
+        info = download_result["info"]
+        ext = download_result["ext"]
+        filesize = download_result["filesize"]
+        duration = download_result["duration"]
+        output_file = download_result["output_file"]
+
+        result = {
+            "success": True,
+            "file_path": str(output_file),
+            "title": info.get("title", "Unknown"),
+            "duration_seconds": info.get("duration", 0),
+            "youtube_id": youtube_id,
+            "ext": ext,
+            "filesize_bytes": filesize,
+        }
+
+        logger.success(
+            f"Download complete: {info.get('title', 'Unknown')}",
+            "download",
+            {
+                "job_id": job_id,
+                "youtube_id": youtube_id,
+                "title": info.get("title"),
+                "duration_seconds": info.get("duration"),
+                "filesize_bytes": filesize,
+                "filesize_mb": round(filesize / (1024 * 1024), 2),
+                "download_time_seconds": round(duration, 2),
+                "format": info.get("format"),
+                "resolution": info.get("resolution"),
+                "ext": ext,
+            }
+        )
+
+        return result
 
     except yt_dlp.utils.DownloadError as e:
         error_msg = str(e)
