@@ -839,11 +839,11 @@ ADMIN_HTML = """
                 timestamp: new Date().toISOString(),
                 level: level,
                 category: category,
-                message: message
+                message: message,
+                seq: Date.now()  // Use timestamp as pseudo-sequence for local logs
             };
-            const key = `${log.timestamp}-${log.message}`;
-            if (!seenLogKeys.has(key)) {
-                seenLogKeys.add(key);
+            if (!seenSeqs.has(log.seq)) {
+                seenSeqs.add(log.seq);
                 serverLogs.push(log);
                 appendLogEntry(log);
             }
