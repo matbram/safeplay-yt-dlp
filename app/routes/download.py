@@ -62,6 +62,31 @@ async def download_video_endpoint(
             {"job_id": request.job_id, "youtube_id": request.youtube_id}
         )
 
+        # Check cache first - if video already exists, return immediately
+        cache_result = await storage.check_video_cache(request.youtube_id)
+        if cache_result.get("exists"):
+            logger.success(
+                f"Cache hit! Returning existing video: {request.youtube_id}",
+                "download",
+                {
+                    "job_id": request.job_id,
+                    "youtube_id": request.youtube_id,
+                    "storage_path": cache_result["storage_path"],
+                    "cached": True
+                }
+            )
+            youtube.update_job_progress(request.job_id, "completed", 100)
+
+            return DownloadResponse(
+                status="success",
+                youtube_id=request.youtube_id,
+                job_id=request.job_id,
+                storage_path=cache_result["storage_path"],
+                duration_seconds=0,  # Unknown for cached
+                title="(cached)",
+                filesize_bytes=cache_result.get("filesize_bytes", 0),
+            )
+
         # Download the video
         result = await youtube.download_video(
             youtube_id=request.youtube_id,

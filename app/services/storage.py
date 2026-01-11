@@ -184,6 +184,47 @@ async def file_exists(storage_path: str) -> bool:
         return False
 
 
+async def check_video_cache(youtube_id: str) -> dict:
+    """
+    Check if a video already exists in Supabase storage.
+
+    Args:
+        youtube_id: YouTube video ID
+
+    Returns:
+        dict: {exists: bool, storage_path: str, filesize_bytes: int} or {exists: False}
+    """
+    try:
+        # Check for common video extensions
+        folder_path = youtube_id
+        result = supabase.storage.from_(settings.STORAGE_BUCKET).list(path=folder_path)
+
+        for item in result:
+            name = item.get("name", "")
+            if name.startswith("video."):
+                storage_path = f"{youtube_id}/{name}"
+                filesize = item.get("metadata", {}).get("size", 0)
+
+                logger.info(
+                    f"Cache hit! Video already exists: {storage_path}",
+                    "storage",
+                    {"youtube_id": youtube_id, "storage_path": storage_path, "filesize_bytes": filesize}
+                )
+
+                return {
+                    "exists": True,
+                    "storage_path": storage_path,
+                    "filesize_bytes": filesize,
+                }
+
+        return {"exists": False}
+
+    except Exception as e:
+        # If folder doesn't exist, that's fine - video not cached
+        logger.debug(f"Cache check for {youtube_id}: not found", "storage")
+        return {"exists": False}
+
+
 def test_supabase_connection() -> bool:
     """
     Test if Supabase connection is working.
