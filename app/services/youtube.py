@@ -169,11 +169,16 @@ def _classify_error(error_msg: str) -> Exception:
     """Classify an error message into the appropriate exception type."""
     error_lower = error_msg.lower()
 
+    # Check for bot detection FIRST - this is retryable with new IP
+    if "confirm you're not a bot" in error_lower or "confirm your not a bot" in error_lower:
+        return DownloadError(error_msg)  # Retryable - try new proxy IP
+
     if "video unavailable" in error_lower or "removed" in error_lower:
         return VideoUnavailableError(error_msg)
     elif "private video" in error_lower:
         return PrivateVideoError(error_msg)
-    elif "age" in error_lower or "sign in" in error_lower:
+    elif "age" in error_lower and "restrict" in error_lower:
+        # Only age-restricted, not bot detection
         return AgeRestrictedError(error_msg)
     elif "copyright" in error_lower:
         return CopyrightBlockedError(error_msg)
