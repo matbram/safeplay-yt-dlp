@@ -20,11 +20,16 @@ else
     echo "✓ aria2c already installed: $(aria2c --version | head -1)"
 fi
 
-# Update yt-dlp to latest version
+# Update yt-dlp to latest version (use venv if exists, otherwise system with --break-system-packages)
 echo ""
 echo "Updating yt-dlp to latest version..."
-pip3 install --upgrade yt-dlp --quiet
-echo "✓ yt-dlp version: $(yt-dlp --version)"
+if [ -d "/opt/safeplay-ytdlp/venv" ]; then
+    /opt/safeplay-ytdlp/venv/bin/pip install --upgrade yt-dlp --quiet
+    echo "✓ yt-dlp version: $(/opt/safeplay-ytdlp/venv/bin/yt-dlp --version)"
+else
+    pip3 install --upgrade yt-dlp --break-system-packages --quiet 2>/dev/null || pip3 install --upgrade yt-dlp --quiet
+    echo "✓ yt-dlp version: $(yt-dlp --version)"
+fi
 
 echo ""
 echo "Installing SafePlay helper commands..."
