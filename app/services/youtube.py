@@ -99,8 +99,8 @@ async def download_video(youtube_id: str, job_id: str) -> dict:
         {"job_id": job_id, "youtube_id": youtube_id, "url": url}
     )
 
-    # Get proxy config and log it
-    proxy_config = get_proxy_config()
+    # Get proxy config with sticky session for this job
+    proxy_config = get_proxy_config(job_id)
     if proxy_config.get("proxy"):
         proxy_url = proxy_config["proxy"]
         # Mask password in log

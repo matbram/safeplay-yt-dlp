@@ -1,35 +1,56 @@
 """OxyLabs residential proxy configuration for yt-dlp with speed optimizations."""
 
+import uuid
 from app.config import settings
 from app.services import logger
 
 
 # OxyLabs endpoints:
-# - pr.oxylabs.io:7777 - HTTP/HTTPS residential (rotating)
+# - pr.oxylabs.io:7777 - SOCKS5/HTTP residential (rotating or sticky)
 # - dc.oxylabs.io:8000 - Datacenter with country targeting
-# - residential.oxylabs.io:60000 - SOCKS5 residential
 
-# Target US proxies for fastest YouTube CDN connection
+# Target US proxies for fastest YouTube CDN connection (NYC droplet = close to US CDNs)
 PROXY_COUNTRY = "US"
 
+# Sticky session duration in minutes (max 1440 = 24 hours)
+# Keeps same IP for entire download - critical for yt-dlp multi-request pattern
+SESSION_TIME_MINUTES = 30
 
-def get_proxy_config() -> dict:
+
+def get_proxy_config(job_id: str = None) -> dict:
     """
-    Get proxy configuration for yt-dlp.
-    Uses SOCKS5h for better video streaming with proxy-side DNS resolution.
+    Get proxy configuration for yt-dlp with sticky sessions.
+
+    Uses SOCKS5h for lower overhead streaming with:
+    - Proxy-side DNS resolution (h suffix)
+    - US country targeting for YouTube CDN proximity
+    - Sticky sessions to maintain same IP across all requests in a download
+
+    Args:
+        job_id: Optional job ID to use as session identifier. If not provided,
+                a unique session ID is generated.
 
     Returns:
         dict: Proxy configuration options for yt-dlp
     """
-    # OxyLabs SOCKS5h residential proxy with country + city targeting
-    # Format: socks5h://USERNAME-cc-COUNTRY-city-CITY:PASSWORD@pr.oxylabs.io:7777
-    # socks5h = proxy handles DNS resolution (better for streaming)
+    # Generate unique session ID for sticky session
+    session_id = job_id if job_id else f"sess_{uuid.uuid4().hex[:12]}"
+
+    # OxyLabs SOCKS5h with sticky session
+    # Format: USERNAME-cc-COUNTRY-sessid-ID-sesstime-MINUTES
+    # - cc-US: Country targeting (no city - adds overhead without benefit)
+    # - sessid: Unique session ID keeps same IP for all requests
+    # - sesstime: Session duration in minutes
     proxy_url = (
-        f"socks5h://{settings.OXYLABS_USERNAME}-cc-{PROXY_COUNTRY}-city-new_york"
+        f"socks5h://{settings.OXYLABS_USERNAME}-cc-{PROXY_COUNTRY}"
+        f"-sessid-{session_id}-sesstime-{SESSION_TIME_MINUTES}"
         f":{settings.OXYLABS_PASSWORD}@pr.oxylabs.io:7777"
     )
 
-    logger.debug(f"Proxy configured: US/NYC SOCKS5h residential via pr.oxylabs.io:7777", "proxy")
+    logger.debug(
+        f"Proxy configured: US SOCKS5h sticky session ({session_id}, {SESSION_TIME_MINUTES}min)",
+        "proxy"
+    )
 
     return {
         "proxy": proxy_url,
