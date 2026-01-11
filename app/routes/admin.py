@@ -5,6 +5,7 @@ import os
 import subprocess
 from datetime import datetime
 from typing import Optional
+from collections import deque
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Depends, HTTPException
 from fastapi.responses import HTMLResponse
@@ -17,6 +18,20 @@ from app.services import logger
 
 
 router = APIRouter(tags=["admin"])
+
+# Queue for real-time log broadcasting
+_pending_logs: deque = deque(maxlen=500)
+_pending_logs_lock = asyncio.Lock()
+
+
+def _queue_log_for_broadcast(entry: dict):
+    """Queue a log entry for broadcast to WebSocket clients."""
+    # This is called synchronously from the logger, so we just append
+    _pending_logs.append(entry)
+
+
+# Register the broadcast callback with the logger
+logger.set_broadcast_callback(_queue_log_for_broadcast)
 
 
 class YtdlpConfig(BaseModel):
@@ -159,20 +174,46 @@ async def websocket_endpoint(websocket: WebSocket):
     connected_clients.append(websocket)
     logger.info(f"WebSocket client connected. Total clients: {len(connected_clients)}", "admin")
 
+    # Track last sequence sent to this client
+    last_seq = 0
+
     try:
         while True:
-            # Send updates every second
-            await asyncio.sleep(1)
+            # Check for pending logs more frequently (100ms)
+            await asyncio.sleep(0.1)
 
-            # Get current state with server-side logs
-            data = {
-                "type": "update",
-                "timestamp": datetime.utcnow().isoformat() + "Z",
-                "jobs": dict(job_progress),
-                "logs": logger.get_logs(limit=50)  # Last 50 logs from server
-            }
+            # Get new logs since last sequence
+            new_logs = []
+            while _pending_logs:
+                try:
+                    log_entry = _pending_logs.popleft()
+                    if log_entry.get("seq", 0) > last_seq:
+                        new_logs.append(log_entry)
+                        last_seq = log_entry.get("seq", last_seq)
+                except IndexError:
+                    break
 
-            await websocket.send_json(data)
+            # Also check buffer for any missed logs
+            if not new_logs:
+                buffer_logs = logger.get_logs(limit=100, since_seq=last_seq)
+                if buffer_logs:
+                    new_logs = buffer_logs
+                    if buffer_logs:
+                        last_seq = max(l.get("seq", 0) for l in buffer_logs)
+
+            # Send update if we have new logs or periodically for job status
+            if new_logs:
+                data = {
+                    "type": "logs",
+                    "timestamp": datetime.utcnow().isoformat() + "Z",
+                    "logs": new_logs,
+                    "jobs": dict(job_progress),
+                }
+                await websocket.send_json(data)
+            else:
+                # Send job status every second even without new logs
+                # Use a counter to only send every 10 iterations (1 second)
+                pass
 
     except WebSocketDisconnect:
         connected_clients.remove(websocket)
@@ -539,7 +580,8 @@ ADMIN_HTML = """
         let ws = null;
         let reconnectAttempts = 0;
         let serverLogs = [];  // Logs from server
-        let seenLogKeys = new Set();  // Track seen logs to avoid duplicates
+        let lastSeq = 0;  // Track last sequence number for incremental updates
+        let seenSeqs = new Set();  // Track seen sequence numbers
         let jobHistory = JSON.parse(localStorage.getItem('safeplay_history') || '[]');
         let stats = JSON.parse(localStorage.getItem('safeplay_stats') || '{"total":0,"success":0,"failed":0,"bytes":0}');
         let currentJobId = null;
@@ -575,7 +617,8 @@ ADMIN_HTML = """
         function renderServerLogs(logs) {
             const container = document.getElementById('logs-content');
             serverLogs = logs;
-            seenLogKeys.clear();
+            seenSeqs.clear();
+            lastSeq = 0;
 
             if (logs.length === 0) {
                 container.innerHTML = '<p class="text-gray-500 text-sm text-center py-4">No logs found. Start a download to see activity.</p>';
@@ -585,8 +628,9 @@ ADMIN_HTML = """
 
             container.innerHTML = '';
             logs.forEach(log => {
-                const key = `${log.timestamp}-${log.message}`;
-                seenLogKeys.add(key);
+                const seq = log.seq || 0;
+                seenSeqs.add(seq);
+                if (seq > lastSeq) lastSeq = seq;
                 appendLogEntry(log);
             });
 
@@ -616,7 +660,8 @@ ADMIN_HTML = """
                 });
                 if (response.ok) {
                     serverLogs = [];
-                    seenLogKeys.clear();
+                    seenSeqs.clear();
+                    lastSeq = 0;
                     document.getElementById('logs-content').innerHTML = '<p class="text-gray-500 text-sm text-center py-4">Logs cleared</p>';
                     document.getElementById('log-count').textContent = '0 logs';
                 }
@@ -678,35 +723,44 @@ ADMIN_HTML = """
         }
 
         function handleWsMessage(data) {
-            if (data.type === 'update') {
+            if (data.type === 'update' || data.type === 'logs') {
                 // Update active jobs
-                updateActiveJobs(data.jobs);
+                if (data.jobs) {
+                    updateActiveJobs(data.jobs);
+                }
 
-                // Update logs from server (only show new ones)
-                if (data.logs) {
+                // Update logs from server (only show new ones based on sequence)
+                if (data.logs && data.logs.length > 0) {
                     const category = document.getElementById('log-category-filter').value;
                     const level = document.getElementById('log-level-filter').value;
 
                     data.logs.forEach(log => {
-                        const key = `${log.timestamp}-${log.message}`;
+                        const seq = log.seq || 0;
+
+                        // Skip if already seen
+                        if (seenSeqs.has(seq)) return;
+
                         // Apply filters
                         if (category && log.category !== category) return;
                         if (level && log.level !== level) return;
 
-                        if (!seenLogKeys.has(key)) {
-                            seenLogKeys.add(key);
-                            serverLogs.push(log);
-                            appendLogEntry(log);
-                            document.getElementById('log-count').textContent = `${serverLogs.length} logs`;
-                        }
+                        seenSeqs.add(seq);
+                        if (seq > lastSeq) lastSeq = seq;
+                        serverLogs.push(log);
+                        appendLogEntry(log);
                     });
+
+                    document.getElementById('log-count').textContent = `${serverLogs.length} logs`;
                 }
 
-                document.getElementById('server-time').textContent = new Date(data.timestamp).toLocaleTimeString();
+                if (data.timestamp) {
+                    document.getElementById('server-time').textContent = new Date(data.timestamp).toLocaleTimeString();
+                }
             } else if (data.type === 'log') {
-                const key = `${data.timestamp}-${data.message}`;
-                if (!seenLogKeys.has(key)) {
-                    seenLogKeys.add(key);
+                const seq = data.seq || 0;
+                if (!seenSeqs.has(seq)) {
+                    seenSeqs.add(seq);
+                    if (seq > lastSeq) lastSeq = seq;
                     serverLogs.push(data);
                     appendLogEntry(data);
                     document.getElementById('log-count').textContent = `${serverLogs.length} logs`;
@@ -785,11 +839,11 @@ ADMIN_HTML = """
                 timestamp: new Date().toISOString(),
                 level: level,
                 category: category,
-                message: message
+                message: message,
+                seq: Date.now()  // Use timestamp as pseudo-sequence for local logs
             };
-            const key = `${log.timestamp}-${log.message}`;
-            if (!seenLogKeys.has(key)) {
-                seenLogKeys.add(key);
+            if (!seenSeqs.has(log.seq)) {
+                seenSeqs.add(log.seq);
                 serverLogs.push(log);
                 appendLogEntry(log);
             }

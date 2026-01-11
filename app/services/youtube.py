@@ -1,9 +1,12 @@
-"""YouTube video download service using yt-dlp with verbose logging."""
+"""YouTube video download service using yt-dlp with verbose logging and speed optimizations."""
 
+import asyncio
 import shutil
+import subprocess
 import time
 from pathlib import Path
 from typing import Optional
+from concurrent.futures import ThreadPoolExecutor
 
 import yt_dlp
 
@@ -17,6 +20,26 @@ from app.utils.exceptions import (
     CopyrightBlockedError,
     DownloadError,
 )
+
+# Thread pool for running blocking downloads
+_download_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="ytdlp")
+
+
+def _check_aria2c_available() -> bool:
+    """Check if aria2c is available for faster downloads."""
+    try:
+        result = subprocess.run(["aria2c", "--version"], capture_output=True, timeout=5)
+        return result.returncode == 0
+    except Exception:
+        return False
+
+
+# Check aria2c availability at startup
+ARIA2C_AVAILABLE = _check_aria2c_available()
+if ARIA2C_AVAILABLE:
+    logger.info("aria2c detected - will use for faster multi-connection downloads", "ytdlp")
+else:
+    logger.warn("aria2c not found - downloads will be slower. Install with: apt install aria2", "ytdlp")
 
 
 # In-memory job progress tracking
@@ -81,8 +104,8 @@ async def download_video(youtube_id: str, job_id: str) -> dict:
         {"job_id": job_id, "youtube_id": youtube_id, "url": url}
     )
 
-    # Get proxy config and log it
-    proxy_config = get_proxy_config()
+    # Get proxy config with sticky session for this job
+    proxy_config = get_proxy_config(job_id)
     if proxy_config.get("proxy"):
         proxy_url = proxy_config["proxy"]
         # Mask password in log
@@ -94,13 +117,14 @@ async def download_video(youtube_id: str, job_id: str) -> dict:
     # Create custom logger for yt-dlp
     ytdlp_logger = logger.YtdlpLogger(job_id)
 
-    # yt-dlp options with verbose logging
+    # yt-dlp options with verbose logging and SPEED OPTIMIZATIONS
     ydl_opts = {
         # Proxy configuration
         **proxy_config,
         # Output template
         "outtmpl": str(temp_dir / f"{youtube_id}.%(ext)s"),
         # Video format - 720p max to save bandwidth, prefer mp4
+        # Prefer non-DASH formats when possible (less throttling)
         "format": "best[height<=720][ext=mp4]/best[height<=720]/best",
         # Progress tracking
         "progress_hooks": [lambda d: _progress_hook(d, job_id)],
@@ -108,19 +132,48 @@ async def download_video(youtube_id: str, job_id: str) -> dict:
         "verbose": True,
         "logger": ytdlp_logger,
         # Retry settings
-        "retries": 3,
-        "fragment_retries": 3,
+        "retries": 5,
+        "fragment_retries": 10,
         # Don't download playlists
         "noplaylist": True,
         # Avoid geo-restrictions
         "geo_bypass": True,
         # Additional debug info
         "print_traffic": False,  # Set True for extreme debugging
+
+        # === SPEED OPTIMIZATIONS ===
+        # Download multiple fragments concurrently (for HLS/DASH streams)
+        "concurrent_fragment_downloads": 8,
+
+        # Buffer settings for faster throughput
+        "buffersize": 1024 * 64,  # 64KB buffer
+
+        # HTTP chunk size for non-fragmented downloads
+        "http_chunk_size": 10485760,  # 10MB chunks
     }
+
+    # Use aria2c if available for MUCH faster downloads (multi-connection)
+    if ARIA2C_AVAILABLE:
+        logger.info("Using aria2c external downloader for faster speeds", "ytdlp", {"job_id": job_id})
+        ydl_opts["external_downloader"] = "aria2c"
+        # aria2c args: -x=connections per server, -s=servers, -k=min split size
+        ydl_opts["external_downloader_args"] = {
+            "aria2c": [
+                "-x", "16",      # 16 connections per server
+                "-s", "16",      # 16 servers
+                "-k", "1M",      # 1MB minimum split size
+                "--file-allocation=none",  # Faster file creation
+                "--max-connection-per-server=16",
+                "--min-split-size=1M",
+                "--split=16",
+            ]
+        }
 
     start_time = time.time()
 
-    try:
+    # Define blocking download function to run in thread
+    def _blocking_download():
+        """Run the blocking yt-dlp download in a separate thread."""
         logger.info("Initializing yt-dlp...", "ytdlp", {"job_id": job_id, "options": {
             "format": ydl_opts["format"],
             "retries": ydl_opts["retries"],
@@ -140,34 +193,54 @@ async def download_video(youtube_id: str, job_id: str) -> dict:
             filesize = output_file.stat().st_size if output_file.exists() else 0
             duration = time.time() - start_time
 
-            result = {
-                "success": True,
-                "file_path": str(output_file),
-                "title": info.get("title", "Unknown"),
-                "duration_seconds": info.get("duration", 0),
-                "youtube_id": youtube_id,
+            return {
+                "info": info,
                 "ext": ext,
-                "filesize_bytes": filesize,
+                "output_file": output_file,
+                "filesize": filesize,
+                "duration": duration,
             }
 
-            logger.success(
-                f"Download complete: {info.get('title', 'Unknown')}",
-                "download",
-                {
-                    "job_id": job_id,
-                    "youtube_id": youtube_id,
-                    "title": info.get("title"),
-                    "duration_seconds": info.get("duration"),
-                    "filesize_bytes": filesize,
-                    "filesize_mb": round(filesize / (1024 * 1024), 2),
-                    "download_time_seconds": round(duration, 2),
-                    "format": info.get("format"),
-                    "resolution": info.get("resolution"),
-                    "ext": ext,
-                }
-            )
+    try:
+        # Run blocking download in thread pool to not block event loop
+        # This allows WebSocket to send real-time log updates
+        loop = asyncio.get_event_loop()
+        download_result = await loop.run_in_executor(_download_executor, _blocking_download)
 
-            return result
+        info = download_result["info"]
+        ext = download_result["ext"]
+        filesize = download_result["filesize"]
+        duration = download_result["duration"]
+        output_file = download_result["output_file"]
+
+        result = {
+            "success": True,
+            "file_path": str(output_file),
+            "title": info.get("title", "Unknown"),
+            "duration_seconds": info.get("duration", 0),
+            "youtube_id": youtube_id,
+            "ext": ext,
+            "filesize_bytes": filesize,
+        }
+
+        logger.success(
+            f"Download complete: {info.get('title', 'Unknown')}",
+            "download",
+            {
+                "job_id": job_id,
+                "youtube_id": youtube_id,
+                "title": info.get("title"),
+                "duration_seconds": info.get("duration"),
+                "filesize_bytes": filesize,
+                "filesize_mb": round(filesize / (1024 * 1024), 2),
+                "download_time_seconds": round(duration, 2),
+                "format": info.get("format"),
+                "resolution": info.get("resolution"),
+                "ext": ext,
+            }
+        )
+
+        return result
 
     except yt_dlp.utils.DownloadError as e:
         error_msg = str(e)

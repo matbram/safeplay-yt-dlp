@@ -1,11 +1,11 @@
-"""Server-side logging service with persistence."""
+"""Server-side logging service with persistence and real-time streaming."""
 
 import json
 import os
 from datetime import datetime
 from pathlib import Path
 from collections import deque
-from typing import Optional
+from typing import Optional, Callable
 import threading
 
 from app.config import settings
@@ -15,6 +15,16 @@ from app.config import settings
 _log_lock = threading.Lock()
 _log_buffer: deque = deque(maxlen=2000)  # Keep last 2000 entries in memory
 _log_file: Optional[Path] = None
+_log_sequence: int = 0  # Global sequence number for ordering
+
+# Callback for real-time broadcasting (set by admin routes)
+_broadcast_callback: Optional[Callable] = None
+
+
+def set_broadcast_callback(callback: Callable):
+    """Set the callback function for broadcasting new logs."""
+    global _broadcast_callback
+    _broadcast_callback = callback
 
 
 def _get_log_file() -> Path:
@@ -40,7 +50,14 @@ def log(level: str, message: str, category: str = "general", details: Optional[d
         category: Category (general, ytdlp, proxy, storage, download)
         details: Optional additional details dict
     """
+    global _log_sequence
+
+    with _log_lock:
+        _log_sequence += 1
+        seq = _log_sequence
+
     entry = {
+        "seq": seq,
         "timestamp": datetime.utcnow().isoformat() + "Z",
         "level": level,
         "category": category,
@@ -57,15 +74,23 @@ def log(level: str, message: str, category: str = "general", details: Optional[d
             log_file = _get_log_file()
             with open(log_file, "a") as f:
                 f.write(json.dumps(entry) + "\n")
+                f.flush()  # Ensure immediate write
         except Exception as e:
             # Don't fail if logging fails
             pass
 
     # Also print to stdout for systemd journal
-    print(f"[{entry['timestamp']}] [{level}] [{category}] {message}")
+    print(f"[{entry['timestamp']}] [{level}] [{category}] {message}", flush=True)
+
+    # Trigger real-time broadcast if callback is set
+    if _broadcast_callback:
+        try:
+            _broadcast_callback(entry)
+        except Exception:
+            pass
 
 
-def get_logs(limit: int = 100, category: Optional[str] = None, level: Optional[str] = None) -> list:
+def get_logs(limit: int = 100, category: Optional[str] = None, level: Optional[str] = None, since_seq: int = 0) -> list:
     """
     Get recent logs from memory buffer.
 
@@ -73,9 +98,14 @@ def get_logs(limit: int = 100, category: Optional[str] = None, level: Optional[s
         limit: Maximum number of logs to return
         category: Filter by category
         level: Filter by level
+        since_seq: Only return logs with sequence > since_seq
     """
     with _log_lock:
         logs = list(_log_buffer)
+
+    # Filter by sequence number first (for incremental updates)
+    if since_seq > 0:
+        logs = [l for l in logs if l.get("seq", 0) > since_seq]
 
     # Apply filters
     if category:
@@ -84,6 +114,11 @@ def get_logs(limit: int = 100, category: Optional[str] = None, level: Optional[s
         logs = [l for l in logs if l.get("level") == level]
 
     return logs[-limit:]
+
+
+def get_latest_sequence() -> int:
+    """Get the current log sequence number."""
+    return _log_sequence
 
 
 def get_logs_from_file(limit: int = 500, category: Optional[str] = None) -> list:

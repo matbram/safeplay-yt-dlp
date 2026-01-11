@@ -1,12 +1,14 @@
 """Supabase storage operations for video uploads."""
 
 import aiofiles
+import time
 from pathlib import Path
 from typing import Optional
 
 from supabase import create_client, Client
 
 from app.config import settings
+from app.services import logger
 
 
 # Initialize Supabase client
@@ -14,6 +16,8 @@ supabase: Client = create_client(
     settings.SUPABASE_URL,
     settings.SUPABASE_SERVICE_KEY
 )
+
+logger.info("Supabase storage client initialized", "storage")
 
 
 async def upload_to_supabase(
@@ -38,10 +42,27 @@ async def upload_to_supabase(
     # Storage path structure: {youtube_id}/video.mp4
     storage_path = f"{youtube_id}/video{file_ext}"
 
+    logger.info(
+        f"Starting upload to Supabase: {storage_path}",
+        "storage",
+        {"job_id": job_id, "youtube_id": youtube_id, "local_path": local_file_path}
+    )
+
     try:
         # Read file content
+        start_time = time.time()
+        logger.debug(f"Reading file: {local_file_path}", "storage", {"job_id": job_id})
+
         async with aiofiles.open(local_file_path, "rb") as f:
             file_content = await f.read()
+
+        file_size = len(file_content)
+        read_time = time.time() - start_time
+        logger.info(
+            f"File read complete: {file_size / (1024*1024):.2f} MB in {read_time:.2f}s",
+            "storage",
+            {"job_id": job_id, "filesize_bytes": file_size, "read_time_seconds": read_time}
+        )
 
         # Determine content type
         content_types = {
@@ -52,23 +73,55 @@ async def upload_to_supabase(
         content_type = content_types.get(file_ext.lower(), "video/mp4")
 
         # Upload to Supabase Storage
+        logger.info(
+            f"Uploading to Supabase bucket '{settings.STORAGE_BUCKET}'...",
+            "storage",
+            {"job_id": job_id, "bucket": settings.STORAGE_BUCKET, "path": storage_path, "content_type": content_type}
+        )
+
+        upload_start = time.time()
         supabase.storage.from_(settings.STORAGE_BUCKET).upload(
             path=storage_path,
             file=file_content,
             file_options={"content-type": content_type, "upsert": "true"}
+        )
+        upload_time = time.time() - upload_start
+
+        logger.success(
+            f"Upload complete: {storage_path} ({file_size / (1024*1024):.2f} MB in {upload_time:.2f}s)",
+            "storage",
+            {
+                "job_id": job_id,
+                "storage_path": storage_path,
+                "filesize_bytes": file_size,
+                "upload_time_seconds": upload_time,
+                "upload_speed_mbps": (file_size / (1024*1024)) / upload_time if upload_time > 0 else 0
+            }
         )
 
         return {
             "success": True,
             "storage_path": storage_path,
             "bucket": settings.STORAGE_BUCKET,
-            "filesize_bytes": len(file_content),
+            "filesize_bytes": file_size,
         }
 
     except Exception as e:
+        error_msg = str(e)
+        logger.error(
+            f"Upload failed: {error_msg}",
+            "storage",
+            {
+                "job_id": job_id,
+                "youtube_id": youtube_id,
+                "storage_path": storage_path,
+                "error": error_msg,
+                "error_type": type(e).__name__
+            }
+        )
         return {
             "success": False,
-            "error": str(e),
+            "error": error_msg,
         }
 
 
