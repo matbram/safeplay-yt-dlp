@@ -1,6 +1,7 @@
-"""YouTube video download service using yt-dlp with verbose logging."""
+"""YouTube video download service using yt-dlp with verbose logging and speed optimizations."""
 
 import shutil
+import subprocess
 import time
 from pathlib import Path
 from typing import Optional
@@ -17,6 +18,23 @@ from app.utils.exceptions import (
     CopyrightBlockedError,
     DownloadError,
 )
+
+
+def _check_aria2c_available() -> bool:
+    """Check if aria2c is available for faster downloads."""
+    try:
+        result = subprocess.run(["aria2c", "--version"], capture_output=True, timeout=5)
+        return result.returncode == 0
+    except Exception:
+        return False
+
+
+# Check aria2c availability at startup
+ARIA2C_AVAILABLE = _check_aria2c_available()
+if ARIA2C_AVAILABLE:
+    logger.info("aria2c detected - will use for faster multi-connection downloads", "ytdlp")
+else:
+    logger.warn("aria2c not found - downloads will be slower. Install with: apt install aria2", "ytdlp")
 
 
 # In-memory job progress tracking
@@ -94,13 +112,14 @@ async def download_video(youtube_id: str, job_id: str) -> dict:
     # Create custom logger for yt-dlp
     ytdlp_logger = logger.YtdlpLogger(job_id)
 
-    # yt-dlp options with verbose logging
+    # yt-dlp options with verbose logging and SPEED OPTIMIZATIONS
     ydl_opts = {
         # Proxy configuration
         **proxy_config,
         # Output template
         "outtmpl": str(temp_dir / f"{youtube_id}.%(ext)s"),
         # Video format - 720p max to save bandwidth, prefer mp4
+        # Prefer non-DASH formats when possible (less throttling)
         "format": "best[height<=720][ext=mp4]/best[height<=720]/best",
         # Progress tracking
         "progress_hooks": [lambda d: _progress_hook(d, job_id)],
@@ -108,15 +127,42 @@ async def download_video(youtube_id: str, job_id: str) -> dict:
         "verbose": True,
         "logger": ytdlp_logger,
         # Retry settings
-        "retries": 3,
-        "fragment_retries": 3,
+        "retries": 5,
+        "fragment_retries": 10,
         # Don't download playlists
         "noplaylist": True,
         # Avoid geo-restrictions
         "geo_bypass": True,
         # Additional debug info
         "print_traffic": False,  # Set True for extreme debugging
+
+        # === SPEED OPTIMIZATIONS ===
+        # Download multiple fragments concurrently (for HLS/DASH streams)
+        "concurrent_fragment_downloads": 8,
+
+        # Buffer settings for faster throughput
+        "buffersize": 1024 * 64,  # 64KB buffer
+
+        # HTTP chunk size for non-fragmented downloads
+        "http_chunk_size": 10485760,  # 10MB chunks
     }
+
+    # Use aria2c if available for MUCH faster downloads (multi-connection)
+    if ARIA2C_AVAILABLE:
+        logger.info("Using aria2c external downloader for faster speeds", "ytdlp", {"job_id": job_id})
+        ydl_opts["external_downloader"] = "aria2c"
+        # aria2c args: -x=connections per server, -s=servers, -k=min split size
+        ydl_opts["external_downloader_args"] = {
+            "aria2c": [
+                "-x", "16",      # 16 connections per server
+                "-s", "16",      # 16 servers
+                "-k", "1M",      # 1MB minimum split size
+                "--file-allocation=none",  # Faster file creation
+                "--max-connection-per-server=16",
+                "--min-split-size=1M",
+                "--split=16",
+            ]
+        }
 
     start_time = time.time()
 

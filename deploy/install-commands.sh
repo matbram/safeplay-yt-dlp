@@ -1,9 +1,32 @@
 #!/bin/bash
-# Install SafePlay helper commands
+# Install SafePlay helper commands and dependencies
 # Run as root: sudo bash /opt/safeplay-ytdlp/deploy/install-commands.sh
 
 set -e
 
+echo "=========================================="
+echo "SafePlay YT-DLP Setup Script"
+echo "=========================================="
+
+# Install aria2c for faster multi-connection downloads
+echo ""
+echo "Checking for aria2c (required for fast downloads)..."
+if ! command -v aria2c &> /dev/null; then
+    echo "Installing aria2c..."
+    apt-get update -qq
+    apt-get install -y aria2
+    echo "✓ aria2c installed"
+else
+    echo "✓ aria2c already installed: $(aria2c --version | head -1)"
+fi
+
+# Update yt-dlp to latest version
+echo ""
+echo "Updating yt-dlp to latest version..."
+pip3 install --upgrade yt-dlp --quiet
+echo "✓ yt-dlp version: $(yt-dlp --version)"
+
+echo ""
 echo "Installing SafePlay helper commands..."
 
 # Create safeplay-update command
