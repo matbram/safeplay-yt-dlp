@@ -12,7 +12,7 @@ from app.models.schemas import (
 )
 from app.services import youtube, storage, logger
 from app.middleware.auth import verify_api_key
-from app.utils.exceptions import SafePlayError
+from app.utils.exceptions import SafePlayError, get_error_response, is_retryable
 
 
 router = APIRouter(tags=["download"])
@@ -111,6 +111,8 @@ async def download_video_endpoint(
                 detail={
                     "error_code": "DOWNLOAD_FAILED",
                     "message": result.get("error", "Download failed"),
+                    "retryable": True,  # Generic download failures may be transient
+                    "user_message": "Download failed. Please try again.",
                 }
             )
 
@@ -135,6 +137,8 @@ async def download_video_endpoint(
                 detail={
                     "error_code": "UPLOAD_FAILED",
                     "message": upload_result.get("error", "Upload failed"),
+                    "retryable": True,  # Storage failures are usually transient
+                    "user_message": "Failed to save the video. Please try again.",
                 }
             )
 
@@ -166,14 +170,11 @@ async def download_video_endpoint(
         )
 
     except SafePlayError as e:
-        # Handle known errors
+        # Handle known errors with full metadata for orchestration
         youtube.update_job_progress(request.job_id, "failed", 0, e.message)
         raise HTTPException(
             status_code=400,
-            detail={
-                "error_code": e.error_code,
-                "message": e.message,
-            }
+            detail=e.to_dict(),  # Includes error_code, message, retryable, user_message
         )
 
     except HTTPException:
@@ -181,15 +182,11 @@ async def download_video_endpoint(
         raise
 
     except Exception as e:
-        # Handle unexpected errors
-        error_msg = str(e)
-        youtube.update_job_progress(request.job_id, "failed", 0, error_msg)
+        # Handle unexpected errors - assume retryable (might be transient)
+        youtube.update_job_progress(request.job_id, "failed", 0, str(e))
         raise HTTPException(
             status_code=500,
-            detail={
-                "error_code": "INTERNAL_ERROR",
-                "message": error_msg,
-            }
+            detail=get_error_response(e),  # Standardized error response
         )
 
 
@@ -200,6 +197,7 @@ async def _process_single_video(
     """
     Process a single video download for batch operations.
     Returns a result item instead of raising exceptions.
+    Includes error metadata for orchestration decision-making.
     """
     try:
         # Check cache first
@@ -226,6 +224,9 @@ async def _process_single_video(
                 job_id=job_id,
                 status="failed",
                 error=result.get("error", "Download failed"),
+                error_code="DOWNLOAD_FAILED",
+                retryable=True,  # Generic failures may be transient
+                user_message="Download failed. Please try again.",
             )
 
         # Upload to Supabase Storage
@@ -242,6 +243,9 @@ async def _process_single_video(
                 job_id=job_id,
                 status="failed",
                 error=upload_result.get("error", "Upload failed"),
+                error_code="UPLOAD_FAILED",
+                retryable=True,  # Storage failures usually transient
+                user_message="Failed to save the video. Please try again.",
             )
 
         youtube.update_job_progress(job_id, "completed", 100)
@@ -256,13 +260,31 @@ async def _process_single_video(
             storage_path=upload_result["storage_path"],
         )
 
+    except SafePlayError as e:
+        # Known error with full metadata
+        youtube.update_job_progress(job_id, "failed", 0, e.message)
+        return BatchDownloadResultItem(
+            youtube_id=youtube_id,
+            job_id=job_id,
+            status="failed",
+            error=e.message,
+            error_code=e.error_code,
+            retryable=e.retryable,
+            user_message=e.user_message,
+        )
+
     except Exception as e:
+        # Unknown error - assume retryable
+        error_response = get_error_response(e)
         youtube.update_job_progress(job_id, "failed", 0, str(e))
         return BatchDownloadResultItem(
             youtube_id=youtube_id,
             job_id=job_id,
             status="failed",
             error=str(e),
+            error_code=error_response["error_code"],
+            retryable=error_response["retryable"],
+            user_message=error_response["user_message"],
         )
 
 

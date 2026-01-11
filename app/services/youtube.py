@@ -19,6 +19,8 @@ from app.utils.exceptions import (
     PrivateVideoError,
     AgeRestrictedError,
     CopyrightBlockedError,
+    LiveStreamError,
+    PremiumContentError,
     DownloadError,
     DownloadTimeoutError,
     BotDetectionError,
@@ -190,23 +192,35 @@ def _is_bot_detection_error(error_msg: str) -> bool:
 
 
 def _classify_error(error_msg: str) -> Exception:
-    """Classify an error message into the appropriate exception type."""
+    """
+    Classify an error message into the appropriate exception type.
+
+    This determines whether the orchestration service should retry
+    or show an error to the user immediately.
+    """
     error_lower = error_msg.lower()
 
     # Check for bot detection FIRST - this is retryable with new IP
     if _is_bot_detection_error(error_msg):
         return BotDetectionError(error_msg)  # Special handling - needs longer delays
 
-    if "video unavailable" in error_lower or "removed" in error_lower:
+    # Permanent errors - video cannot be downloaded
+    if "video unavailable" in error_lower or "removed" in error_lower or "does not exist" in error_lower:
         return VideoUnavailableError(error_msg)
-    elif "private video" in error_lower:
+    elif "private video" in error_lower or "video is private" in error_lower:
         return PrivateVideoError(error_msg)
     elif "age" in error_lower and "restrict" in error_lower:
-        # Only age-restricted, not bot detection
         return AgeRestrictedError(error_msg)
-    elif "copyright" in error_lower:
+    elif "copyright" in error_lower or "blocked" in error_lower:
         return CopyrightBlockedError(error_msg)
+    elif "live" in error_lower and ("stream" in error_lower or "event" in error_lower):
+        return LiveStreamError(error_msg)
+    elif "premium" in error_lower or "members only" in error_lower or "membership" in error_lower:
+        return PremiumContentError(error_msg)
+    elif "join this channel" in error_lower:
+        return PremiumContentError(error_msg)
     else:
+        # Default to retryable download error
         return DownloadError(error_msg)
 
 
