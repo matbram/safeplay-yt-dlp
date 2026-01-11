@@ -42,12 +42,28 @@ def _check_aria2c_available() -> bool:
         return False
 
 
+def _check_nodejs_available() -> bool:
+    """Check if Node.js is available for YouTube JS challenges."""
+    try:
+        result = subprocess.run(["node", "--version"], capture_output=True, timeout=5)
+        return result.returncode == 0
+    except Exception:
+        return False
+
+
 # Check aria2c availability at startup
 ARIA2C_AVAILABLE = _check_aria2c_available()
 if ARIA2C_AVAILABLE:
     logger.info("aria2c detected - will use for faster multi-connection downloads", "ytdlp")
 else:
     logger.warn("aria2c not found - downloads will be slower. Install with: apt install aria2", "ytdlp")
+
+# Check Node.js availability at startup (required for YouTube bot challenges)
+NODEJS_AVAILABLE = _check_nodejs_available()
+if NODEJS_AVAILABLE:
+    logger.info("Node.js detected - will use for YouTube JS challenges", "ytdlp")
+else:
+    logger.error("Node.js NOT found - YouTube downloads may fail with bot detection! Install with: apt install nodejs", "ytdlp")
 
 
 # In-memory job progress tracking
@@ -239,6 +255,10 @@ async def _download_single_attempt(
         "buffersize": 1024 * 64,
         "http_chunk_size": 10485760,
     }
+
+    # Enable Node.js for YouTube bot challenge solving
+    if NODEJS_AVAILABLE:
+        ydl_opts["js_runtimes"] = {"node": {}}
 
     # Use aria2c if available
     if ARIA2C_AVAILABLE:
