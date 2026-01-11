@@ -44,10 +44,10 @@ async def upload_to_supabase(
         dict: Upload result with storage_path and filesize_bytes
     """
     file_path = Path(local_file_path)
-    file_ext = file_path.suffix  # .mp4, .webm, etc.
+    file_ext = file_path.suffix  # .m4a, .webm, .mp3, etc.
 
-    # Storage path structure: {youtube_id}/video.mp4
-    storage_path = f"{youtube_id}/video{file_ext}"
+    # Storage path structure: {youtube_id}/audio.m4a
+    storage_path = f"{youtube_id}/audio{file_ext}"
 
     logger.info(
         f"Starting upload to Supabase: {storage_path}",
@@ -71,13 +71,16 @@ async def upload_to_supabase(
             {"job_id": job_id, "filesize_bytes": file_size, "read_time_seconds": read_time}
         )
 
-        # Determine content type
+        # Determine content type (audio formats for transcription)
         content_types = {
-            ".mp4": "video/mp4",
-            ".webm": "video/webm",
-            ".mkv": "video/x-matroska",
+            ".m4a": "audio/mp4",
+            ".mp3": "audio/mpeg",
+            ".webm": "audio/webm",
+            ".ogg": "audio/ogg",
+            ".opus": "audio/opus",
+            ".wav": "audio/wav",
         }
-        content_type = content_types.get(file_ext.lower(), "video/mp4")
+        content_type = content_types.get(file_ext.lower(), "audio/mp4")
 
         # Upload to Supabase Storage (run in thread pool for parallel execution)
         logger.info(
@@ -211,7 +214,7 @@ async def file_exists(storage_path: str) -> bool:
 
 async def check_video_cache(youtube_id: str) -> dict:
     """
-    Check if a video already exists in Supabase storage.
+    Check if audio already exists in Supabase storage.
 
     Args:
         youtube_id: YouTube video ID
@@ -220,18 +223,19 @@ async def check_video_cache(youtube_id: str) -> dict:
         dict: {exists: bool, storage_path: str, filesize_bytes: int} or {exists: False}
     """
     try:
-        # Check for common video extensions
+        # Check for audio files (also check legacy video files for backwards compat)
         folder_path = youtube_id
         result = supabase.storage.from_(settings.STORAGE_BUCKET).list(path=folder_path)
 
         for item in result:
             name = item.get("name", "")
-            if name.startswith("video."):
+            # Check for audio files first, then video files for backwards compatibility
+            if name.startswith("audio.") or name.startswith("video."):
                 storage_path = f"{youtube_id}/{name}"
                 filesize = item.get("metadata", {}).get("size", 0)
 
                 logger.info(
-                    f"Cache hit! Video already exists: {storage_path}",
+                    f"Cache hit! Audio already exists: {storage_path}",
                     "storage",
                     {"youtube_id": youtube_id, "storage_path": storage_path, "filesize_bytes": filesize}
                 )

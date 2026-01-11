@@ -26,7 +26,7 @@ from app.utils.exceptions import (
 )
 
 # === RELIABILITY CONFIGURATION ===
-DOWNLOAD_TIMEOUT_SECONDS = 60  # Max time for a single download attempt
+DOWNLOAD_TIMEOUT_SECONDS = 180  # Max time for a single download attempt (3 min for large files + ffmpeg)
 MAX_RETRY_ATTEMPTS = 5  # Number of retry attempts (increased for bot detection)
 RETRY_BACKOFF_SECONDS = [1, 2, 5, 10]  # Escalating backoff - longer delays help get fresh IPs
 CIRCUIT_BREAKER_DELAY = 30  # Final attempt after this delay if all retries fail with bot detection
@@ -248,7 +248,9 @@ async def _download_single_attempt(
     ydl_opts = {
         **proxy_config,
         "outtmpl": str(temp_dir / f"{youtube_id}.%(ext)s"),
-        "format": "best[height<=720][ext=mp4]/best[height<=720]/best",
+        # Audio only - much smaller files, perfect for transcription
+        # m4a preferred (AAC codec), fallback to any best audio
+        "format": "bestaudio[ext=m4a]/bestaudio",
         "progress_hooks": [lambda d: _progress_hook(d, job_id)],
         "verbose": True,
         "logger": ytdlp_logger,
