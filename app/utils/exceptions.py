@@ -66,6 +66,13 @@ class DownloadTimeoutError(SafePlayError):
         super().__init__(message, "DOWNLOAD_TIMEOUT")
 
 
+class BotDetectionError(SafePlayError):
+    """Raised when YouTube detects us as a bot - retryable with new IP."""
+
+    def __init__(self, message: str = "Bot detection triggered"):
+        super().__init__(message, "BOT_DETECTED")
+
+
 # Error classification helpers
 PERMANENT_ERRORS = (VideoUnavailableError, PrivateVideoError, AgeRestrictedError, CopyrightBlockedError)
-RETRYABLE_ERRORS = (DownloadError, ProxyError, DownloadTimeoutError)
+RETRYABLE_ERRORS = (DownloadError, ProxyError, DownloadTimeoutError, BotDetectionError)

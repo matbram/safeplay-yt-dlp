@@ -21,13 +21,15 @@ from app.utils.exceptions import (
     CopyrightBlockedError,
     DownloadError,
     DownloadTimeoutError,
+    BotDetectionError,
     PERMANENT_ERRORS,
 )
 
 # === RELIABILITY CONFIGURATION ===
 DOWNLOAD_TIMEOUT_SECONDS = 60  # Max time for a single download attempt
-MAX_RETRY_ATTEMPTS = 3  # Number of retry attempts
-RETRY_BACKOFF_SECONDS = [1, 2]  # Backoff between retries (fast for speed)
+MAX_RETRY_ATTEMPTS = 5  # Number of retry attempts (increased for bot detection)
+RETRY_BACKOFF_SECONDS = [1, 2, 5, 10]  # Escalating backoff - longer delays help get fresh IPs
+CIRCUIT_BREAKER_DELAY = 30  # Final attempt after this delay if all retries fail with bot detection
 
 # Thread pool for running blocking downloads (8 workers for parallel capacity)
 _download_executor = ThreadPoolExecutor(max_workers=8, thread_name_prefix="ytdlp")
@@ -181,13 +183,19 @@ def _progress_hook(d: dict, job_id: str) -> None:
         logger.error(f"Download error in progress hook", "ytdlp", {"job_id": job_id, "data": str(d)})
 
 
+def _is_bot_detection_error(error_msg: str) -> bool:
+    """Check if the error is a bot detection error."""
+    error_lower = error_msg.lower()
+    return "confirm you're not a bot" in error_lower or "confirm your not a bot" in error_lower
+
+
 def _classify_error(error_msg: str) -> Exception:
     """Classify an error message into the appropriate exception type."""
     error_lower = error_msg.lower()
 
     # Check for bot detection FIRST - this is retryable with new IP
-    if "confirm you're not a bot" in error_lower or "confirm your not a bot" in error_lower:
-        return DownloadError(error_msg)  # Retryable - try new proxy IP
+    if _is_bot_detection_error(error_msg):
+        return BotDetectionError(error_msg)  # Special handling - needs longer delays
 
     if "video unavailable" in error_lower or "removed" in error_lower:
         return VideoUnavailableError(error_msg)
@@ -330,8 +338,9 @@ async def download_video(youtube_id: str, job_id: str) -> dict:
 
     Features:
     - 60 second timeout per attempt (fail fast)
-    - Up to 3 retry attempts with new proxy sessions
-    - Fast backoff (1s, 2s) between retries
+    - Up to 5 retry attempts with new proxy sessions
+    - Escalating backoff (1s, 2s, 5s, 10s) between retries
+    - Special handling for bot detection: longer delays + circuit breaker
     - Immediate failure for permanent errors (video unavailable, private, etc.)
 
     Args:
@@ -352,6 +361,7 @@ async def download_video(youtube_id: str, job_id: str) -> dict:
 
     last_error = None
     total_start = time.time()
+    bot_detection_count = 0  # Track consecutive bot detections
 
     for attempt in range(1, MAX_RETRY_ATTEMPTS + 1):
         # Check for cancellation
@@ -368,7 +378,8 @@ async def download_video(youtube_id: str, job_id: str) -> dict:
         job_progress[job_id]["status"] = "downloading"
 
         # Use unique proxy session for each attempt (new IP on retry)
-        proxy_session_id = f"{job_id}-attempt{attempt}-{uuid.uuid4().hex[:8]}"
+        # Add more randomness for bot detection retries
+        proxy_session_id = f"{job_id}-a{attempt}-{uuid.uuid4().hex[:12]}"
 
         try:
             result = await _download_single_attempt(youtube_id, job_id, attempt, proxy_session_id)
@@ -386,6 +397,7 @@ async def download_video(youtube_id: str, job_id: str) -> dict:
                     "download_time_seconds": round(result.get("download_time", 0), 2),
                     "total_time_seconds": round(total_duration, 2),
                     "attempts": attempt,
+                    "bot_detections": bot_detection_count,
                 }
             )
             return result
@@ -408,6 +420,28 @@ async def download_video(youtube_id: str, job_id: str) -> dict:
                 "error": "Download cancelled by user",
             }
 
+        except BotDetectionError as e:
+            # Special handling for bot detection - track and use longer delays
+            bot_detection_count += 1
+            last_error = e
+            error_msg = e.message
+
+            if attempt < MAX_RETRY_ATTEMPTS:
+                # Use longer delays for bot detection to let proxy pool rotate
+                backoff = RETRY_BACKOFF_SECONDS[min(attempt - 1, len(RETRY_BACKOFF_SECONDS) - 1)]
+                logger.warn(
+                    f"Bot detection #{bot_detection_count} on attempt {attempt}, retrying in {backoff}s with fresh IP...",
+                    "download",
+                    {"job_id": job_id, "attempt": attempt, "backoff": backoff, "bot_detections": bot_detection_count}
+                )
+                await asyncio.sleep(backoff)
+            else:
+                logger.warn(
+                    f"All {MAX_RETRY_ATTEMPTS} attempts hit bot detection, trying circuit breaker ({CIRCUIT_BREAKER_DELAY}s delay)...",
+                    "download",
+                    {"job_id": job_id, "bot_detections": bot_detection_count}
+                )
+
         except Exception as e:
             last_error = e
             error_msg = str(e) if not hasattr(e, 'message') else e.message
@@ -428,6 +462,48 @@ async def download_video(youtube_id: str, job_id: str) -> dict:
                     {"job_id": job_id, "youtube_id": youtube_id, "final_error": error_msg}
                 )
 
+    # Circuit breaker: If all attempts failed with bot detection, wait longer and try one more time
+    if bot_detection_count >= MAX_RETRY_ATTEMPTS - 1:
+        logger.info(
+            f"Circuit breaker activated: waiting {CIRCUIT_BREAKER_DELAY}s before final attempt",
+            "download",
+            {"job_id": job_id, "youtube_id": youtube_id, "bot_detections": bot_detection_count}
+        )
+
+        await asyncio.sleep(CIRCUIT_BREAKER_DELAY)
+
+        # Final attempt with completely fresh session
+        job_progress[job_id]["attempt"] = MAX_RETRY_ATTEMPTS + 1
+        job_progress[job_id]["status"] = "downloading"
+        proxy_session_id = f"circuit-{uuid.uuid4().hex}"
+
+        try:
+            result = await _download_single_attempt(youtube_id, job_id, MAX_RETRY_ATTEMPTS + 1, proxy_session_id)
+
+            total_duration = time.time() - total_start
+            logger.success(
+                f"Circuit breaker SUCCESS: {result.get('title', 'Unknown')}",
+                "download",
+                {
+                    "job_id": job_id,
+                    "youtube_id": youtube_id,
+                    "title": result.get("title"),
+                    "total_time_seconds": round(total_duration, 2),
+                    "attempts": MAX_RETRY_ATTEMPTS + 1,
+                    "bot_detections": bot_detection_count,
+                    "circuit_breaker": True,
+                }
+            )
+            return result
+
+        except Exception as e:
+            last_error = e
+            logger.error(
+                f"Circuit breaker failed for {youtube_id}",
+                "download",
+                {"job_id": job_id, "error": str(e)[:100]}
+            )
+
     # All retries exhausted
     total_duration = time.time() - total_start
     job_progress[job_id] = {
@@ -435,6 +511,7 @@ async def download_video(youtube_id: str, job_id: str) -> dict:
         "progress": 0,
         "error": str(last_error),
         "attempts": MAX_RETRY_ATTEMPTS,
+        "bot_detections": bot_detection_count,
     }
 
     # Return failure with details
@@ -443,6 +520,7 @@ async def download_video(youtube_id: str, job_id: str) -> dict:
         "youtube_id": youtube_id,
         "error": str(last_error),
         "attempts": MAX_RETRY_ATTEMPTS,
+        "bot_detections": bot_detection_count,
         "total_time": total_duration,
     }
 
