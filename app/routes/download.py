@@ -3,12 +3,25 @@
 from fastapi import APIRouter, HTTPException, Depends, BackgroundTasks
 
 from app.models.schemas import DownloadRequest, DownloadResponse
-from app.services import youtube, storage
+from app.services import youtube, storage, logger
 from app.middleware.auth import verify_api_key
 from app.utils.exceptions import SafePlayError
 
 
 router = APIRouter(tags=["download"])
+
+
+@router.get("/api/download/status/{job_id}")
+async def get_job_status(
+    job_id: str,
+    api_key: str = Depends(verify_api_key),
+):
+    """Get the status of a download job."""
+    status = youtube.get_job_status(job_id)
+    return {
+        "job_id": job_id,
+        **status
+    }
 
 
 @router.post(
@@ -43,6 +56,12 @@ async def download_video_endpoint(
         DownloadResponse with storage path and video metadata
     """
     try:
+        logger.info(
+            f"Download request received: {request.youtube_id}",
+            "download",
+            {"job_id": request.job_id, "youtube_id": request.youtube_id}
+        )
+
         # Download the video
         result = await youtube.download_video(
             youtube_id=request.youtube_id,
@@ -50,6 +69,11 @@ async def download_video_endpoint(
         )
 
         if not result.get("success"):
+            logger.error(
+                f"Download failed for {request.youtube_id}",
+                "download",
+                {"job_id": request.job_id, "error": result.get("error")}
+            )
             raise HTTPException(
                 status_code=400,
                 detail={
@@ -69,6 +93,11 @@ async def download_video_endpoint(
         )
 
         if not upload_result.get("success"):
+            logger.error(
+                f"Upload failed for {request.youtube_id}",
+                "download",
+                {"job_id": request.job_id, "error": upload_result.get("error")}
+            )
             raise HTTPException(
                 status_code=500,
                 detail={
@@ -79,6 +108,17 @@ async def download_video_endpoint(
 
         # Update progress to completed
         youtube.update_job_progress(request.job_id, "completed", 100)
+
+        logger.success(
+            f"Download + upload complete for {request.youtube_id}",
+            "download",
+            {
+                "job_id": request.job_id,
+                "youtube_id": request.youtube_id,
+                "storage_path": upload_result["storage_path"],
+                "filesize_bytes": upload_result.get("filesize_bytes", 0)
+            }
+        )
 
         # Schedule cleanup of temp files
         background_tasks.add_task(youtube.cleanup_temp_files, request.job_id)
