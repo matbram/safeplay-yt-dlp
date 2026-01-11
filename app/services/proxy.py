@@ -21,8 +21,7 @@ def get_proxy_config(job_id: str = None) -> dict:
     """
     Get proxy configuration for yt-dlp with sticky sessions.
 
-    Uses SOCKS5h for lower overhead streaming with:
-    - Proxy-side DNS resolution (h suffix)
+    Uses HTTP proxy with:
     - US country targeting for YouTube CDN proximity
     - Sticky sessions to maintain same IP across all requests in a download
 
@@ -36,19 +35,19 @@ def get_proxy_config(job_id: str = None) -> dict:
     # Generate unique session ID for sticky session
     session_id = job_id if job_id else f"sess_{uuid.uuid4().hex[:12]}"
 
-    # OxyLabs SOCKS5h with sticky session
+    # OxyLabs HTTP with sticky session
     # Format: USERNAME-cc-COUNTRY-sessid-ID-sesstime-MINUTES
     # - cc-US: Country targeting (no city - adds overhead without benefit)
     # - sessid: Unique session ID keeps same IP for all requests
     # - sesstime: Session duration in minutes
     proxy_url = (
-        f"socks5h://{settings.OXYLABS_USERNAME}-cc-{PROXY_COUNTRY}"
+        f"http://{settings.OXYLABS_USERNAME}-cc-{PROXY_COUNTRY}"
         f"-sessid-{session_id}-sesstime-{SESSION_TIME_MINUTES}"
         f":{settings.OXYLABS_PASSWORD}@pr.oxylabs.io:7777"
     )
 
     logger.debug(
-        f"Proxy configured: US SOCKS5h sticky session ({session_id}, {SESSION_TIME_MINUTES}min)",
+        f"Proxy configured: US HTTP sticky session ({session_id}, {SESSION_TIME_MINUTES}min)",
         "proxy"
     )
 
