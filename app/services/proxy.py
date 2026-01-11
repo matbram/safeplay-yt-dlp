@@ -16,19 +16,19 @@ PROXY_COUNTRY = "US"
 def get_proxy_config() -> dict:
     """
     Get proxy configuration for yt-dlp.
-    Uses SOCKS5 for better video streaming performance.
+    Uses US-based residential proxy for faster YouTube CDN routing.
 
     Returns:
         dict: Proxy configuration options for yt-dlp
     """
-    # OxyLabs SOCKS5 residential proxy with country targeting
-    # Format: USERNAME-country-COUNTRY:PASSWORD@residential.oxylabs.io:60000
+    # OxyLabs HTTP residential proxy with country targeting (working)
+    # SOCKS5 on port 60000 was unreachable
     proxy_url = (
-        f"socks5://{settings.OXYLABS_USERNAME}-country-{PROXY_COUNTRY}"
-        f":{settings.OXYLABS_PASSWORD}@residential.oxylabs.io:60000"
+        f"http://{settings.OXYLABS_USERNAME}-country-{PROXY_COUNTRY}"
+        f":{settings.OXYLABS_PASSWORD}@pr.oxylabs.io:7777"
     )
 
-    logger.debug(f"Proxy configured: US SOCKS5 residential via residential.oxylabs.io:60000", "proxy")
+    logger.debug(f"Proxy configured: US HTTP residential via pr.oxylabs.io:7777", "proxy")
 
     return {
         "proxy": proxy_url,
