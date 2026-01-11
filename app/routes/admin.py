@@ -13,7 +13,7 @@ from pydantic import BaseModel
 
 from app.config import settings
 from app.middleware.auth import verify_api_key
-from app.services.youtube import job_progress
+from app.services.youtube import job_progress, cancel_job, cancel_all_jobs, clear_completed_jobs
 from app.services import logger
 
 
@@ -105,6 +105,29 @@ async def get_logs_stats(api_key: str = Depends(verify_api_key)):
 async def get_jobs(api_key: str = Depends(verify_api_key)):
     """Get all current job statuses."""
     return {"jobs": dict(job_progress)}
+
+
+@router.post("/api/admin/jobs/{job_id}/cancel")
+async def cancel_job_endpoint(job_id: str, api_key: str = Depends(verify_api_key)):
+    """Cancel a specific job."""
+    success = cancel_job(job_id)
+    if success:
+        return {"status": "cancelled", "job_id": job_id}
+    raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
+
+
+@router.post("/api/admin/jobs/cancel-all")
+async def cancel_all_jobs_endpoint(api_key: str = Depends(verify_api_key)):
+    """Cancel all active jobs."""
+    count = cancel_all_jobs()
+    return {"status": "cancelled", "count": count}
+
+
+@router.delete("/api/admin/jobs")
+async def clear_jobs_endpoint(api_key: str = Depends(verify_api_key)):
+    """Clear all completed/failed/cancelled jobs from tracking."""
+    count = clear_completed_jobs()
+    return {"status": "cleared", "count": count}
 
 
 @router.get("/api/admin/system")
@@ -416,7 +439,13 @@ ADMIN_HTML = """
                         Active Jobs
                         <span id="active-jobs-count" class="text-xs bg-blue-600 px-2 py-0.5 rounded-full">0</span>
                     </h2>
-                    <span class="w-2 h-2 bg-green-500 rounded-full live-indicator"></span>
+                    <div class="flex items-center gap-2">
+                        <button onclick="killAllJobs()" class="text-xs bg-red-600 hover:bg-red-700 text-white px-2 py-1 rounded flex items-center gap-1">
+                            <i data-lucide="x-circle" class="w-3 h-3"></i>
+                            Kill All
+                        </button>
+                        <span class="w-2 h-2 bg-green-500 rounded-full live-indicator"></span>
+                    </div>
                 </div>
                 <div class="p-3">
                     <div id="active-jobs" class="space-y-2 max-h-64 overflow-y-auto">
@@ -778,11 +807,15 @@ ADMIN_HTML = """
                 return;
             }
 
+            const activeStatuses = ['pending', 'downloading', 'uploading', 'cancelling'];
             container.innerHTML = Object.entries(jobs).map(([jobId, job]) => `
                 <div class="bg-gray-700 rounded p-2">
                     <div class="flex items-center justify-between">
-                        <span class="font-mono text-xs truncate max-w-32">${jobId}</span>
-                        <span class="text-xs px-2 py-0.5 rounded ${getStatusClass(job.status)}">${job.status}</span>
+                        <span class="font-mono text-xs truncate max-w-24">${jobId}</span>
+                        <div class="flex items-center gap-2">
+                            <span class="text-xs px-2 py-0.5 rounded ${getStatusClass(job.status)}">${job.status}</span>
+                            ${activeStatuses.includes(job.status) ? `<button onclick="killJob('${jobId}')" class="text-xs text-red-400 hover:text-red-300 px-1" title="Kill this job"><i data-lucide="x" class="w-3 h-3"></i></button>` : ''}
+                        </div>
                     </div>
                     <div class="mt-1">
                         <div class="w-full bg-gray-600 rounded-full h-1">
@@ -793,10 +826,55 @@ ADMIN_HTML = """
                 </div>
             `).join('');
 
+            // Re-init icons for dynamically added elements
+            lucide.createIcons();
+
             // Update current job progress if matching
             if (currentJobId && jobs[currentJobId]) {
                 const job = jobs[currentJobId];
                 updateProgress(job.progress, job.status);
+            }
+        }
+
+        async function killJob(jobId) {
+            const apiKey = document.getElementById('api-key').value;
+            if (!apiKey) { alert('Please enter your API key'); return; }
+
+            try {
+                const response = await fetch(`/api/admin/jobs/${jobId}/cancel`, {
+                    method: 'POST',
+                    headers: { 'X-API-Key': apiKey }
+                });
+                if (response.ok) {
+                    addLocalLog('WARN', `Cancelled job: ${jobId}`);
+                } else {
+                    const data = await response.json();
+                    addLocalLog('ERROR', `Failed to cancel job: ${data.detail || 'Unknown error'}`);
+                }
+            } catch (e) {
+                addLocalLog('ERROR', `Failed to cancel job: ${e.message}`);
+            }
+        }
+
+        async function killAllJobs() {
+            const apiKey = document.getElementById('api-key').value;
+            if (!apiKey) { alert('Please enter your API key'); return; }
+
+            if (!confirm('Cancel all active downloads?')) return;
+
+            try {
+                const response = await fetch('/api/admin/jobs/cancel-all', {
+                    method: 'POST',
+                    headers: { 'X-API-Key': apiKey }
+                });
+                if (response.ok) {
+                    const data = await response.json();
+                    addLocalLog('WARN', `Cancelled ${data.count} active jobs`);
+                } else {
+                    addLocalLog('ERROR', 'Failed to cancel jobs');
+                }
+            } catch (e) {
+                addLocalLog('ERROR', `Failed to cancel jobs: ${e.message}`);
             }
         }
 
