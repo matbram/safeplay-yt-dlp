@@ -21,10 +21,11 @@ def get_proxy_config() -> dict:
     Returns:
         dict: Proxy configuration options for yt-dlp
     """
-    # OxyLabs format with country targeting:
-    # user-USERNAME-country-US:PASSWORD@pr.oxylabs.io:7777
+    # OxyLabs format for country targeting:
+    # customer-USERNAME-cc-COUNTRY:PASSWORD@pr.oxylabs.io:7777
+    # Note: OXYLABS_USERNAME already contains "customer-" prefix
     proxy_url = (
-        f"http://user-{settings.OXYLABS_USERNAME}-country-{PROXY_COUNTRY}"
+        f"http://{settings.OXYLABS_USERNAME}-cc-{PROXY_COUNTRY}"
         f":{settings.OXYLABS_PASSWORD}@pr.oxylabs.io:7777"
     )
 
