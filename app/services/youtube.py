@@ -4,6 +4,7 @@ import asyncio
 import shutil
 import subprocess
 import time
+import uuid
 from pathlib import Path
 from typing import Optional
 from concurrent.futures import ThreadPoolExecutor
@@ -19,7 +20,14 @@ from app.utils.exceptions import (
     AgeRestrictedError,
     CopyrightBlockedError,
     DownloadError,
+    DownloadTimeoutError,
+    PERMANENT_ERRORS,
 )
+
+# === RELIABILITY CONFIGURATION ===
+DOWNLOAD_TIMEOUT_SECONDS = 60  # Max time for a single download attempt
+MAX_RETRY_ATTEMPTS = 3  # Number of retry attempts
+RETRY_BACKOFF_SECONDS = [1, 2]  # Backoff between retries (fast for speed)
 
 # Thread pool for running blocking downloads (8 workers for parallel capacity)
 _download_executor = ThreadPoolExecutor(max_workers=8, thread_name_prefix="ytdlp")
@@ -157,245 +165,261 @@ def _progress_hook(d: dict, job_id: str) -> None:
         logger.error(f"Download error in progress hook", "ytdlp", {"job_id": job_id, "data": str(d)})
 
 
-async def download_video(youtube_id: str, job_id: str) -> dict:
+def _classify_error(error_msg: str) -> Exception:
+    """Classify an error message into the appropriate exception type."""
+    error_lower = error_msg.lower()
+
+    if "video unavailable" in error_lower or "removed" in error_lower:
+        return VideoUnavailableError(error_msg)
+    elif "private video" in error_lower:
+        return PrivateVideoError(error_msg)
+    elif "age" in error_lower or "sign in" in error_lower:
+        return AgeRestrictedError(error_msg)
+    elif "copyright" in error_lower:
+        return CopyrightBlockedError(error_msg)
+    else:
+        return DownloadError(error_msg)
+
+
+async def _download_single_attempt(
+    youtube_id: str,
+    job_id: str,
+    attempt: int,
+    proxy_session_id: str,
+) -> dict:
     """
-    Download YouTube video using yt-dlp through OxyLabs proxy.
-    Includes verbose logging for debugging.
+    Execute a single download attempt with timeout.
+
+    Args:
+        youtube_id: YouTube video ID
+        job_id: Job tracking ID
+        attempt: Current attempt number (1-based)
+        proxy_session_id: Unique session ID for proxy sticky session
+
+    Returns:
+        dict with download result or raises exception
     """
     url = f"https://www.youtube.com/watch?v={youtube_id}"
     temp_dir = Path(settings.TEMP_DIR) / job_id
     temp_dir.mkdir(parents=True, exist_ok=True)
 
-    # Initialize progress
-    job_progress[job_id] = {"status": "pending", "progress": 0}
-
-    logger.info(
-        f"Starting download for video: {youtube_id}",
-        "download",
-        {"job_id": job_id, "youtube_id": youtube_id, "url": url}
-    )
-
-    # Get proxy config with sticky session for this job
-    proxy_config = get_proxy_config(job_id)
+    # Get proxy config with unique session for this attempt
+    proxy_config = get_proxy_config(proxy_session_id)
     if proxy_config.get("proxy"):
         proxy_url = proxy_config["proxy"]
-        # Mask password in log
         masked_proxy = proxy_url.split("@")[-1] if "@" in proxy_url else proxy_url
-        logger.info(f"Using proxy: {masked_proxy}", "proxy", {"job_id": job_id})
-    else:
-        logger.warn("No proxy configured - downloading directly", "proxy", {"job_id": job_id})
+        logger.info(f"Attempt {attempt}: Using proxy {masked_proxy}", "proxy", {
+            "job_id": job_id, "attempt": attempt, "session_id": proxy_session_id
+        })
 
     # Create custom logger for yt-dlp
     ytdlp_logger = logger.YtdlpLogger(job_id)
 
-    # yt-dlp options with verbose logging and SPEED OPTIMIZATIONS
+    # yt-dlp options optimized for SPEED
     ydl_opts = {
-        # Proxy configuration
         **proxy_config,
-        # Output template
         "outtmpl": str(temp_dir / f"{youtube_id}.%(ext)s"),
-        # Video format - 720p max to save bandwidth, prefer mp4
-        # Prefer non-DASH formats when possible (less throttling)
         "format": "best[height<=720][ext=mp4]/best[height<=720]/best",
-        # Progress tracking
         "progress_hooks": [lambda d: _progress_hook(d, job_id)],
-        # Verbose logging (captured by our logger)
         "verbose": True,
         "logger": ytdlp_logger,
-        # Retry settings
-        "retries": 5,
-        "fragment_retries": 10,
-        # Don't download playlists
+        # Reduced retries for speed - we handle retries at higher level
+        "retries": 2,
+        "fragment_retries": 3,
         "noplaylist": True,
-        # Avoid geo-restrictions
         "geo_bypass": True,
-        # Additional debug info
-        "print_traffic": False,  # Set True for extreme debugging
-
-        # === SPEED OPTIMIZATIONS ===
-        # Download multiple fragments concurrently (for HLS/DASH streams)
+        "socket_timeout": 30,  # Socket timeout for speed
+        # Speed optimizations
         "concurrent_fragment_downloads": 8,
-
-        # Buffer settings for faster throughput
-        "buffersize": 1024 * 64,  # 64KB buffer
-
-        # HTTP chunk size for non-fragmented downloads
-        "http_chunk_size": 10485760,  # 10MB chunks
+        "buffersize": 1024 * 64,
+        "http_chunk_size": 10485760,
     }
 
-    # Use aria2c if available for MUCH faster downloads (multi-connection)
+    # Use aria2c if available
     if ARIA2C_AVAILABLE:
-        logger.info("Using aria2c external downloader for faster speeds", "ytdlp", {"job_id": job_id})
         ydl_opts["external_downloader"] = "aria2c"
-        # aria2c args: -x=connections per server, -s=servers, -k=min split size
         ydl_opts["external_downloader_args"] = {
             "aria2c": [
-                "-x", "16",      # 16 connections per server
-                "-s", "16",      # 16 servers
-                "-k", "1M",      # 1MB minimum split size
-                "--file-allocation=none",  # Faster file creation
+                "-x", "16", "-s", "16", "-k", "1M",
+                "--file-allocation=none",
                 "--max-connection-per-server=16",
-                "--min-split-size=1M",
-                "--split=16",
+                "--min-split-size=1M", "--split=16",
+                "--timeout=30",  # aria2c timeout
             ]
         }
 
     start_time = time.time()
 
-    # Define blocking download function to run in thread
     def _blocking_download():
-        """Run the blocking yt-dlp download in a separate thread."""
-        logger.info("Initializing yt-dlp...", "ytdlp", {"job_id": job_id, "options": {
-            "format": ydl_opts["format"],
-            "retries": ydl_opts["retries"],
-            "geo_bypass": ydl_opts["geo_bypass"],
-        }})
-
+        """Run blocking yt-dlp download."""
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            # Extract info and download
-            logger.info("Extracting video info...", "ytdlp", {"job_id": job_id})
             info = ydl.extract_info(url, download=True)
-
-            # Find the downloaded file
             ext = info.get("ext", "mp4")
             output_file = temp_dir / f"{youtube_id}.{ext}"
-
-            # Get file size
             filesize = output_file.stat().st_size if output_file.exists() else 0
-            duration = time.time() - start_time
 
             return {
                 "info": info,
                 "ext": ext,
                 "output_file": output_file,
                 "filesize": filesize,
-                "duration": duration,
+                "duration": time.time() - start_time,
             }
 
     try:
-        # Run blocking download in thread pool to not block event loop
-        # This allows WebSocket to send real-time log updates
+        # Run with timeout
         loop = asyncio.get_event_loop()
-        download_result = await loop.run_in_executor(_download_executor, _blocking_download)
+        download_task = loop.run_in_executor(_download_executor, _blocking_download)
+        download_result = await asyncio.wait_for(download_task, timeout=DOWNLOAD_TIMEOUT_SECONDS)
 
         info = download_result["info"]
-        ext = download_result["ext"]
-        filesize = download_result["filesize"]
-        duration = download_result["duration"]
-        output_file = download_result["output_file"]
-
-        result = {
+        return {
             "success": True,
-            "file_path": str(output_file),
+            "file_path": str(download_result["output_file"]),
             "title": info.get("title", "Unknown"),
             "duration_seconds": info.get("duration", 0),
             "youtube_id": youtube_id,
-            "ext": ext,
-            "filesize_bytes": filesize,
+            "ext": download_result["ext"],
+            "filesize_bytes": download_result["filesize"],
+            "download_time": download_result["duration"],
         }
 
-        logger.success(
-            f"Download complete: {info.get('title', 'Unknown')}",
-            "download",
-            {
-                "job_id": job_id,
-                "youtube_id": youtube_id,
-                "title": info.get("title"),
-                "duration_seconds": info.get("duration"),
-                "filesize_bytes": filesize,
-                "filesize_mb": round(filesize / (1024 * 1024), 2),
-                "download_time_seconds": round(duration, 2),
-                "format": info.get("format"),
-                "resolution": info.get("resolution"),
-                "ext": ext,
-            }
-        )
-
-        return result
-
-    except DownloadCancelled:
-        # Clean up cancelled job
-        job_progress[job_id] = {
-            "status": "cancelled",
-            "progress": 0,
-            "error": "Cancelled by user",
-        }
-        cancelled_jobs.discard(job_id)
-
-        # Clean up temp files
-        try:
-            if temp_dir.exists():
-                shutil.rmtree(temp_dir)
-        except Exception:
-            pass
-
-        return {
-            "success": False,
-            "cancelled": True,
-            "youtube_id": youtube_id,
-            "error": "Download cancelled by user",
-        }
+    except asyncio.TimeoutError:
+        duration = time.time() - start_time
+        logger.warn(f"Attempt {attempt} timed out after {duration:.1f}s", "download", {
+            "job_id": job_id, "attempt": attempt, "timeout": DOWNLOAD_TIMEOUT_SECONDS
+        })
+        raise DownloadTimeoutError(f"Download timed out after {DOWNLOAD_TIMEOUT_SECONDS}s")
 
     except yt_dlp.utils.DownloadError as e:
         error_msg = str(e)
-        duration = time.time() - start_time
+        logger.warn(f"Attempt {attempt} failed: {error_msg[:100]}", "download", {
+            "job_id": job_id, "attempt": attempt
+        })
+        raise _classify_error(error_msg)
 
-        logger.error(
-            f"yt-dlp download error: {error_msg}",
-            "ytdlp",
-            {
-                "job_id": job_id,
+
+async def download_video(youtube_id: str, job_id: str) -> dict:
+    """
+    Download YouTube video with automatic retries and timeouts.
+
+    Features:
+    - 60 second timeout per attempt (fail fast)
+    - Up to 3 retry attempts with new proxy sessions
+    - Fast backoff (1s, 2s) between retries
+    - Immediate failure for permanent errors (video unavailable, private, etc.)
+
+    Args:
+        youtube_id: YouTube video ID
+        job_id: Job ID for tracking
+
+    Returns:
+        dict with success status and file info
+    """
+    # Initialize progress
+    job_progress[job_id] = {"status": "pending", "progress": 0, "attempt": 1}
+
+    logger.info(
+        f"Starting download for video: {youtube_id}",
+        "download",
+        {"job_id": job_id, "youtube_id": youtube_id, "max_attempts": MAX_RETRY_ATTEMPTS}
+    )
+
+    last_error = None
+    total_start = time.time()
+
+    for attempt in range(1, MAX_RETRY_ATTEMPTS + 1):
+        # Check for cancellation
+        if is_job_cancelled(job_id):
+            return {
+                "success": False,
+                "cancelled": True,
                 "youtube_id": youtube_id,
-                "error_type": "DownloadError",
-                "error_message": error_msg,
-                "duration_seconds": round(duration, 2),
+                "error": "Download cancelled by user",
             }
-        )
 
-        job_progress[job_id] = {
-            "status": "failed",
-            "progress": 0,
-            "error": error_msg,
-        }
+        # Update progress with attempt number
+        job_progress[job_id]["attempt"] = attempt
+        job_progress[job_id]["status"] = "downloading"
 
-        # Classify the error
-        if "Video unavailable" in error_msg or "removed" in error_msg.lower():
-            logger.error("Video is unavailable or removed", "download", {"job_id": job_id})
-            raise VideoUnavailableError(error_msg)
-        elif "Private video" in error_msg:
-            logger.error("Video is private", "download", {"job_id": job_id})
-            raise PrivateVideoError(error_msg)
-        elif "age" in error_msg.lower() or "sign in" in error_msg.lower():
-            logger.error("Video is age-restricted", "download", {"job_id": job_id})
-            raise AgeRestrictedError(error_msg)
-        elif "copyright" in error_msg.lower():
-            logger.error("Video blocked due to copyright", "download", {"job_id": job_id})
-            raise CopyrightBlockedError(error_msg)
-        else:
-            raise DownloadError(error_msg)
+        # Use unique proxy session for each attempt (new IP on retry)
+        proxy_session_id = f"{job_id}-attempt{attempt}-{uuid.uuid4().hex[:8]}"
 
-    except Exception as e:
-        error_msg = str(e)
-        duration = time.time() - start_time
+        try:
+            result = await _download_single_attempt(youtube_id, job_id, attempt, proxy_session_id)
 
-        logger.error(
-            f"Unexpected error during download: {error_msg}",
-            "download",
-            {
-                "job_id": job_id,
+            # Success! Log and return
+            total_duration = time.time() - total_start
+            logger.success(
+                f"Download complete: {result.get('title', 'Unknown')} (attempt {attempt})",
+                "download",
+                {
+                    "job_id": job_id,
+                    "youtube_id": youtube_id,
+                    "title": result.get("title"),
+                    "filesize_mb": round(result.get("filesize_bytes", 0) / (1024 * 1024), 2),
+                    "download_time_seconds": round(result.get("download_time", 0), 2),
+                    "total_time_seconds": round(total_duration, 2),
+                    "attempts": attempt,
+                }
+            )
+            return result
+
+        except PERMANENT_ERRORS as e:
+            # Don't retry permanent errors - fail immediately
+            logger.error(f"Permanent error (no retry): {e.message}", "download", {
+                "job_id": job_id, "error_code": e.error_code, "attempt": attempt
+            })
+            job_progress[job_id] = {"status": "failed", "progress": 0, "error": e.message}
+            raise
+
+        except DownloadCancelled:
+            job_progress[job_id] = {"status": "cancelled", "progress": 0, "error": "Cancelled by user"}
+            cancelled_jobs.discard(job_id)
+            return {
+                "success": False,
+                "cancelled": True,
                 "youtube_id": youtube_id,
-                "error_type": type(e).__name__,
-                "error_message": error_msg,
-                "duration_seconds": round(duration, 2),
+                "error": "Download cancelled by user",
             }
-        )
 
-        job_progress[job_id] = {
-            "status": "failed",
-            "progress": 0,
-            "error": error_msg,
-        }
-        raise DownloadError(error_msg)
+        except Exception as e:
+            last_error = e
+            error_msg = str(e) if not hasattr(e, 'message') else e.message
+
+            # Check if we should retry
+            if attempt < MAX_RETRY_ATTEMPTS:
+                backoff = RETRY_BACKOFF_SECONDS[min(attempt - 1, len(RETRY_BACKOFF_SECONDS) - 1)]
+                logger.warn(
+                    f"Attempt {attempt} failed, retrying in {backoff}s with new proxy...",
+                    "download",
+                    {"job_id": job_id, "attempt": attempt, "backoff": backoff, "error": error_msg[:100]}
+                )
+                await asyncio.sleep(backoff)
+            else:
+                logger.error(
+                    f"All {MAX_RETRY_ATTEMPTS} attempts failed for {youtube_id}",
+                    "download",
+                    {"job_id": job_id, "youtube_id": youtube_id, "final_error": error_msg}
+                )
+
+    # All retries exhausted
+    total_duration = time.time() - total_start
+    job_progress[job_id] = {
+        "status": "failed",
+        "progress": 0,
+        "error": str(last_error),
+        "attempts": MAX_RETRY_ATTEMPTS,
+    }
+
+    # Return failure with details
+    return {
+        "success": False,
+        "youtube_id": youtube_id,
+        "error": str(last_error),
+        "attempts": MAX_RETRY_ATTEMPTS,
+        "total_time": total_duration,
+    }
 
 
 def get_job_status(job_id: str) -> dict:

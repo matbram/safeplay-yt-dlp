@@ -57,3 +57,15 @@ class ProxyError(SafePlayError):
 
     def __init__(self, message: str = "Proxy connection failed"):
         super().__init__(message, "PROXY_ERROR")
+
+
+class DownloadTimeoutError(SafePlayError):
+    """Raised when download times out."""
+
+    def __init__(self, message: str = "Download timed out"):
+        super().__init__(message, "DOWNLOAD_TIMEOUT")
+
+
+# Error classification helpers
+PERMANENT_ERRORS = (VideoUnavailableError, PrivateVideoError, AgeRestrictedError, CopyrightBlockedError)
+RETRYABLE_ERRORS = (DownloadError, ProxyError, DownloadTimeoutError)

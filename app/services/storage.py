@@ -12,6 +12,8 @@ from supabase import create_client, Client
 from app.config import settings
 from app.services import logger
 
+# === RELIABILITY CONFIGURATION ===
+UPLOAD_TIMEOUT_SECONDS = 45  # Max time for upload (generous for large files)
 
 # Initialize Supabase client
 supabase: Client = create_client(
@@ -93,8 +95,21 @@ async def upload_to_supabase(
             )
 
         upload_start = time.time()
-        loop = asyncio.get_event_loop()
-        await loop.run_in_executor(_upload_executor, _blocking_upload)
+        try:
+            loop = asyncio.get_event_loop()
+            upload_task = loop.run_in_executor(_upload_executor, _blocking_upload)
+            await asyncio.wait_for(upload_task, timeout=UPLOAD_TIMEOUT_SECONDS)
+        except asyncio.TimeoutError:
+            upload_time = time.time() - upload_start
+            logger.error(
+                f"Upload timed out after {upload_time:.1f}s",
+                "storage",
+                {"job_id": job_id, "timeout": UPLOAD_TIMEOUT_SECONDS, "filesize_mb": file_size / (1024*1024)}
+            )
+            return {
+                "success": False,
+                "error": f"Upload timed out after {UPLOAD_TIMEOUT_SECONDS}s",
+            }
         upload_time = time.time() - upload_start
 
         logger.success(
