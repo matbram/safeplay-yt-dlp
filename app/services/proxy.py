@@ -6,30 +6,23 @@ from app.services import logger
 
 # OxyLabs endpoints:
 # - pr.oxylabs.io:7777 - HTTP/HTTPS residential (rotating)
-# - us-pr.oxylabs.io:10001 - US-specific residential
 # - residential.oxylabs.io:60000 - SOCKS5 residential (faster for streaming)
-
-# Target US proxies for fastest YouTube CDN connection
-# YouTube's primary CDN servers are in the US
-PROXY_COUNTRY = "us"
 
 
 def get_proxy_config() -> dict:
     """
     Get optimized proxy configuration for yt-dlp.
-    Uses US-based residential proxy for fastest YouTube CDN routing.
 
     Returns:
         dict: Proxy configuration options for yt-dlp
     """
-    # Use US-specific proxy for better YouTube CDN routing
-    # Format: customer-USER-cc-COUNTRY:PASS@pr.oxylabs.io:7777
+    # Standard OxyLabs format (working)
     proxy_url = (
-        f"http://customer-{settings.OXYLABS_USERNAME}-cc-{PROXY_COUNTRY}"
-        f":{settings.OXYLABS_PASSWORD}@pr.oxylabs.io:7777"
+        f"http://{settings.OXYLABS_USERNAME}:{settings.OXYLABS_PASSWORD}"
+        f"@pr.oxylabs.io:7777"
     )
 
-    logger.debug(f"Proxy configured: US residential via pr.oxylabs.io:7777", "proxy")
+    logger.debug(f"Proxy configured: pr.oxylabs.io:7777", "proxy")
 
     return {
         "proxy": proxy_url,
