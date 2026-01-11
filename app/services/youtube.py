@@ -45,9 +45,80 @@ else:
 # In-memory job progress tracking
 job_progress: dict[str, dict] = {}
 
+# Set of job IDs that should be cancelled
+cancelled_jobs: set[str] = set()
+
+
+def cancel_job(job_id: str) -> bool:
+    """
+    Request cancellation of a specific job.
+
+    Args:
+        job_id: The job ID to cancel
+
+    Returns:
+        bool: True if job was found and marked for cancellation
+    """
+    if job_id in job_progress:
+        cancelled_jobs.add(job_id)
+        job_progress[job_id]["status"] = "cancelling"
+        logger.info(f"Job cancellation requested: {job_id}", "download", {"job_id": job_id})
+        return True
+    return False
+
+
+def cancel_all_jobs() -> int:
+    """
+    Cancel all active jobs.
+
+    Returns:
+        int: Number of jobs marked for cancellation
+    """
+    count = 0
+    for job_id, progress in job_progress.items():
+        if progress.get("status") in ("pending", "downloading", "uploading"):
+            cancelled_jobs.add(job_id)
+            job_progress[job_id]["status"] = "cancelling"
+            count += 1
+    if count > 0:
+        logger.info(f"Cancelled {count} active jobs", "download")
+    return count
+
+
+def clear_completed_jobs() -> int:
+    """
+    Clear all completed/failed/cancelled jobs from tracking.
+
+    Returns:
+        int: Number of jobs cleared
+    """
+    to_remove = [
+        job_id for job_id, progress in job_progress.items()
+        if progress.get("status") in ("completed", "failed", "cancelled")
+    ]
+    for job_id in to_remove:
+        del job_progress[job_id]
+        cancelled_jobs.discard(job_id)
+    return len(to_remove)
+
+
+def is_job_cancelled(job_id: str) -> bool:
+    """Check if a job has been cancelled."""
+    return job_id in cancelled_jobs
+
+
+class DownloadCancelled(Exception):
+    """Raised when a download is cancelled."""
+    pass
+
 
 def _progress_hook(d: dict, job_id: str) -> None:
     """Track download progress with detailed logging."""
+    # Check for cancellation
+    if is_job_cancelled(job_id):
+        logger.info(f"Download cancelled by user", "download", {"job_id": job_id})
+        raise DownloadCancelled(f"Job {job_id} was cancelled")
+
     if d["status"] == "downloading":
         total = d.get("total_bytes") or d.get("total_bytes_estimate", 0)
         downloaded = d.get("downloaded_bytes", 0)
@@ -241,6 +312,29 @@ async def download_video(youtube_id: str, job_id: str) -> dict:
         )
 
         return result
+
+    except DownloadCancelled:
+        # Clean up cancelled job
+        job_progress[job_id] = {
+            "status": "cancelled",
+            "progress": 0,
+            "error": "Cancelled by user",
+        }
+        cancelled_jobs.discard(job_id)
+
+        # Clean up temp files
+        try:
+            if temp_dir.exists():
+                shutil.rmtree(temp_dir)
+        except Exception:
+            pass
+
+        return {
+            "success": False,
+            "cancelled": True,
+            "youtube_id": youtube_id,
+            "error": "Download cancelled by user",
+        }
 
     except yt_dlp.utils.DownloadError as e:
         error_msg = str(e)
