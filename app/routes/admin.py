@@ -1,9 +1,190 @@
-"""Admin dashboard routes."""
+"""Admin dashboard routes with real-time updates and configuration."""
 
-from fastapi import APIRouter, Request
+import asyncio
+import os
+import subprocess
+from datetime import datetime
+from typing import Optional
+from collections import deque
+
+from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Depends, HTTPException
 from fastapi.responses import HTMLResponse
+from pydantic import BaseModel
+
+from app.config import settings
+from app.middleware.auth import verify_api_key
+from app.services.youtube import job_progress
+
 
 router = APIRouter(tags=["admin"])
+
+
+# In-memory log buffer (last 500 lines)
+log_buffer = deque(maxlen=500)
+
+
+def add_log(level: str, message: str):
+    """Add a log entry to the buffer."""
+    timestamp = datetime.utcnow().isoformat() + "Z"
+    log_buffer.append({
+        "timestamp": timestamp,
+        "level": level,
+        "message": message
+    })
+
+
+# Initialize with startup message
+add_log("INFO", "Admin dashboard initialized")
+
+
+class YtdlpConfig(BaseModel):
+    """YT-DLP configuration options."""
+    max_height: int = 720
+    format_preference: str = "mp4"
+    retries: int = 3
+    fragment_retries: int = 3
+    concurrent_fragments: int = 1
+    rate_limit: Optional[str] = None  # e.g., "50M" for 50MB/s
+    geo_bypass: bool = True
+    no_playlist: bool = True
+
+
+# Current yt-dlp config (in-memory, can be persisted to file)
+current_config = YtdlpConfig()
+
+
+@router.get("/api/admin/config", response_model=YtdlpConfig)
+async def get_config(api_key: str = Depends(verify_api_key)):
+    """Get current yt-dlp configuration."""
+    return current_config
+
+
+@router.post("/api/admin/config", response_model=YtdlpConfig)
+async def update_config(config: YtdlpConfig, api_key: str = Depends(verify_api_key)):
+    """Update yt-dlp configuration."""
+    global current_config
+    current_config = config
+    add_log("INFO", f"Configuration updated: max_height={config.max_height}, format={config.format_preference}")
+    return current_config
+
+
+@router.get("/api/admin/logs")
+async def get_logs(limit: int = 100, api_key: str = Depends(verify_api_key)):
+    """Get recent logs."""
+    logs = list(log_buffer)[-limit:]
+    return {"logs": logs}
+
+
+@router.get("/api/admin/jobs")
+async def get_jobs(api_key: str = Depends(verify_api_key)):
+    """Get all current job statuses."""
+    return {"jobs": dict(job_progress)}
+
+
+@router.get("/api/admin/system")
+async def get_system_info(api_key: str = Depends(verify_api_key)):
+    """Get system information."""
+    import shutil
+
+    # Disk usage
+    total, used, free = shutil.disk_usage("/")
+
+    # Memory (if available)
+    try:
+        with open("/proc/meminfo") as f:
+            meminfo = f.read()
+        mem_total = int([x for x in meminfo.split('\n') if 'MemTotal' in x][0].split()[1]) // 1024
+        mem_available = int([x for x in meminfo.split('\n') if 'MemAvailable' in x][0].split()[1]) // 1024
+    except:
+        mem_total = 0
+        mem_available = 0
+
+    # Temp directory size
+    temp_size = 0
+    try:
+        for dirpath, dirnames, filenames in os.walk(settings.TEMP_DIR):
+            for f in filenames:
+                fp = os.path.join(dirpath, f)
+                temp_size += os.path.getsize(fp)
+    except:
+        pass
+
+    # yt-dlp version
+    try:
+        result = subprocess.run(["yt-dlp", "--version"], capture_output=True, text=True)
+        ytdlp_version = result.stdout.strip()
+    except:
+        ytdlp_version = "unknown"
+
+    return {
+        "disk": {
+            "total_gb": round(total / (1024**3), 2),
+            "used_gb": round(used / (1024**3), 2),
+            "free_gb": round(free / (1024**3), 2),
+            "percent_used": round((used / total) * 100, 1)
+        },
+        "memory": {
+            "total_mb": mem_total,
+            "available_mb": mem_available,
+            "percent_used": round(((mem_total - mem_available) / mem_total) * 100, 1) if mem_total > 0 else 0
+        },
+        "temp_dir": {
+            "path": settings.TEMP_DIR,
+            "size_mb": round(temp_size / (1024**2), 2)
+        },
+        "ytdlp_version": ytdlp_version,
+        "environment": settings.ENVIRONMENT
+    }
+
+
+# WebSocket connections for real-time updates
+connected_clients: list[WebSocket] = []
+
+
+@router.websocket("/ws/admin")
+async def websocket_endpoint(websocket: WebSocket):
+    """WebSocket endpoint for real-time updates."""
+    await websocket.accept()
+    connected_clients.append(websocket)
+    add_log("INFO", f"WebSocket client connected. Total clients: {len(connected_clients)}")
+
+    try:
+        while True:
+            # Send updates every second
+            await asyncio.sleep(1)
+
+            # Get current state
+            data = {
+                "type": "update",
+                "timestamp": datetime.utcnow().isoformat() + "Z",
+                "jobs": dict(job_progress),
+                "logs": list(log_buffer)[-20:]  # Last 20 logs
+            }
+
+            await websocket.send_json(data)
+
+    except WebSocketDisconnect:
+        connected_clients.remove(websocket)
+        add_log("INFO", f"WebSocket client disconnected. Total clients: {len(connected_clients)}")
+    except Exception as e:
+        if websocket in connected_clients:
+            connected_clients.remove(websocket)
+
+
+async def broadcast_log(level: str, message: str):
+    """Broadcast a log message to all connected clients."""
+    add_log(level, message)
+
+    for client in connected_clients:
+        try:
+            await client.send_json({
+                "type": "log",
+                "timestamp": datetime.utcnow().isoformat() + "Z",
+                "level": level,
+                "message": message
+            })
+        except:
+            pass
 
 
 ADMIN_HTML = """
@@ -19,175 +200,290 @@ ADMIN_HTML = """
         .status-ok { color: #22c55e; }
         .status-error { color: #ef4444; }
         .status-warn { color: #f59e0b; }
-        .log-entry { font-family: monospace; font-size: 12px; }
+        .log-entry { font-family: 'Monaco', 'Menlo', monospace; font-size: 11px; }
+        .log-INFO { color: #60a5fa; }
+        .log-WARN { color: #fbbf24; }
+        .log-ERROR { color: #f87171; }
+        .log-SUCCESS { color: #4ade80; }
         .pulse { animation: pulse 2s infinite; }
         @keyframes pulse {
             0%, 100% { opacity: 1; }
             50% { opacity: 0.5; }
         }
+        .live-indicator {
+            animation: blink 1s infinite;
+        }
+        @keyframes blink {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.3; }
+        }
+        #logs-container {
+            height: 300px;
+            overflow-y: auto;
+            scroll-behavior: smooth;
+        }
+        #logs-container::-webkit-scrollbar {
+            width: 8px;
+        }
+        #logs-container::-webkit-scrollbar-track {
+            background: #1f2937;
+        }
+        #logs-container::-webkit-scrollbar-thumb {
+            background: #4b5563;
+            border-radius: 4px;
+        }
     </style>
 </head>
 <body class="bg-gray-900 text-gray-100 min-h-screen">
-    <div class="container mx-auto px-4 py-8 max-w-6xl">
+    <div class="container mx-auto px-4 py-6 max-w-7xl">
         <!-- Header -->
-        <div class="flex items-center justify-between mb-8">
+        <div class="flex items-center justify-between mb-6">
             <div>
-                <h1 class="text-3xl font-bold text-white">SafePlay YT-DLP</h1>
-                <p class="text-gray-400">Admin Dashboard</p>
+                <h1 class="text-2xl font-bold text-white flex items-center gap-2">
+                    <i data-lucide="play-circle" class="w-8 h-8 text-blue-500"></i>
+                    SafePlay YT-DLP Admin
+                </h1>
+                <p class="text-gray-400 text-sm">Real-time monitoring and control</p>
             </div>
-            <div id="connection-status" class="flex items-center gap-2">
-                <span class="w-3 h-3 bg-green-500 rounded-full pulse"></span>
-                <span class="text-sm text-gray-400">Connected</span>
+            <div class="flex items-center gap-4">
+                <div id="ws-status" class="flex items-center gap-2">
+                    <span class="w-2 h-2 bg-gray-500 rounded-full"></span>
+                    <span class="text-sm text-gray-400">Connecting...</span>
+                </div>
+                <div class="text-sm text-gray-500" id="server-time">--</div>
+            </div>
+        </div>
+
+        <!-- API Key Input (collapsible) -->
+        <div class="mb-4">
+            <button onclick="toggleApiKey()" class="text-sm text-gray-400 hover:text-white flex items-center gap-1">
+                <i data-lucide="key" class="w-4 h-4"></i>
+                <span id="api-key-toggle-text">Show API Key</span>
+            </button>
+            <div id="api-key-section" class="hidden mt-2">
+                <input type="password" id="api-key"
+                       class="w-full md:w-96 bg-gray-800 border border-gray-600 rounded px-3 py-2 text-white text-sm focus:outline-none focus:border-blue-500"
+                       placeholder="Enter your API key">
             </div>
         </div>
 
         <!-- Health Status Cards -->
-        <div class="grid grid-cols-1 md:grid-cols-4 gap-4 mb-8">
-            <div class="bg-gray-800 rounded-lg p-4 border border-gray-700">
-                <div class="flex items-center justify-between">
-                    <span class="text-gray-400 text-sm">Service Status</span>
-                    <i data-lucide="activity" class="w-5 h-5 text-gray-500"></i>
-                </div>
-                <div id="service-status" class="text-2xl font-bold mt-2 status-ok">--</div>
+        <div class="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-6 gap-3 mb-6">
+            <div class="bg-gray-800 rounded-lg p-3 border border-gray-700">
+                <div class="text-gray-400 text-xs mb-1">Status</div>
+                <div id="service-status" class="text-lg font-bold status-ok">--</div>
             </div>
-            <div class="bg-gray-800 rounded-lg p-4 border border-gray-700">
-                <div class="flex items-center justify-between">
-                    <span class="text-gray-400 text-sm">YT-DLP</span>
-                    <i data-lucide="download" class="w-5 h-5 text-gray-500"></i>
-                </div>
-                <div id="ytdlp-status" class="text-2xl font-bold mt-2">--</div>
+            <div class="bg-gray-800 rounded-lg p-3 border border-gray-700">
+                <div class="text-gray-400 text-xs mb-1">YT-DLP</div>
+                <div id="ytdlp-status" class="text-lg font-bold">--</div>
             </div>
-            <div class="bg-gray-800 rounded-lg p-4 border border-gray-700">
-                <div class="flex items-center justify-between">
-                    <span class="text-gray-400 text-sm">Supabase</span>
-                    <i data-lucide="database" class="w-5 h-5 text-gray-500"></i>
-                </div>
-                <div id="supabase-status" class="text-2xl font-bold mt-2">--</div>
+            <div class="bg-gray-800 rounded-lg p-3 border border-gray-700">
+                <div class="text-gray-400 text-xs mb-1">Supabase</div>
+                <div id="supabase-status" class="text-lg font-bold">--</div>
             </div>
-            <div class="bg-gray-800 rounded-lg p-4 border border-gray-700">
-                <div class="flex items-center justify-between">
-                    <span class="text-gray-400 text-sm">Proxy</span>
-                    <i data-lucide="shield" class="w-5 h-5 text-gray-500"></i>
-                </div>
-                <div id="proxy-status" class="text-2xl font-bold mt-2">--</div>
+            <div class="bg-gray-800 rounded-lg p-3 border border-gray-700">
+                <div class="text-gray-400 text-xs mb-1">Proxy</div>
+                <div id="proxy-status" class="text-lg font-bold">--</div>
+            </div>
+            <div class="bg-gray-800 rounded-lg p-3 border border-gray-700">
+                <div class="text-gray-400 text-xs mb-1">Disk Free</div>
+                <div id="disk-free" class="text-lg font-bold">--</div>
+            </div>
+            <div class="bg-gray-800 rounded-lg p-3 border border-gray-700">
+                <div class="text-gray-400 text-xs mb-1">Memory</div>
+                <div id="memory-used" class="text-lg font-bold">--</div>
             </div>
         </div>
 
-        <!-- Main Content Grid -->
-        <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
+        <!-- Main Grid -->
+        <div class="grid grid-cols-1 lg:grid-cols-3 gap-4 mb-6">
             <!-- Download Test Panel -->
             <div class="bg-gray-800 rounded-lg border border-gray-700">
-                <div class="p-4 border-b border-gray-700">
-                    <h2 class="text-lg font-semibold flex items-center gap-2">
-                        <i data-lucide="play-circle" class="w-5 h-5"></i>
+                <div class="p-3 border-b border-gray-700">
+                    <h2 class="font-semibold flex items-center gap-2">
+                        <i data-lucide="download" class="w-4 h-4"></i>
                         Test Download
                     </h2>
                 </div>
-                <div class="p-4">
-                    <div class="space-y-4">
+                <div class="p-3">
+                    <div class="space-y-3">
                         <div>
-                            <label class="block text-sm text-gray-400 mb-1">API Key</label>
-                            <input type="password" id="api-key"
-                                   class="w-full bg-gray-700 border border-gray-600 rounded px-3 py-2 text-white focus:outline-none focus:border-blue-500"
-                                   placeholder="Enter your API key">
-                        </div>
-                        <div>
-                            <label class="block text-sm text-gray-400 mb-1">YouTube URL or Video ID</label>
+                            <label class="block text-xs text-gray-400 mb-1">YouTube URL or Video ID</label>
                             <input type="text" id="youtube-input"
-                                   class="w-full bg-gray-700 border border-gray-600 rounded px-3 py-2 text-white focus:outline-none focus:border-blue-500"
-                                   placeholder="e.g., dQw4w9WgXcQ or https://youtube.com/watch?v=...">
+                                   class="w-full bg-gray-700 border border-gray-600 rounded px-3 py-2 text-sm text-white focus:outline-none focus:border-blue-500"
+                                   placeholder="e.g., dQw4w9WgXcQ">
                         </div>
                         <button onclick="startDownload()"
-                                class="w-full bg-blue-600 hover:bg-blue-700 text-white font-medium py-2 px-4 rounded flex items-center justify-center gap-2 transition">
+                                id="download-btn"
+                                class="w-full bg-blue-600 hover:bg-blue-700 disabled:bg-gray-600 text-white font-medium py-2 px-4 rounded text-sm flex items-center justify-center gap-2 transition">
                             <i data-lucide="download" class="w-4 h-4"></i>
                             Start Download
                         </button>
                     </div>
 
-                    <!-- Progress Section -->
-                    <div id="progress-section" class="mt-6 hidden">
-                        <div class="flex items-center justify-between mb-2">
-                            <span class="text-sm text-gray-400">Progress</span>
-                            <span id="progress-percent" class="text-sm font-mono">0%</span>
+                    <!-- Progress -->
+                    <div id="progress-section" class="mt-4 hidden">
+                        <div class="flex items-center justify-between mb-1">
+                            <span class="text-xs text-gray-400" id="progress-status">Starting...</span>
+                            <span id="progress-percent" class="text-xs font-mono">0%</span>
                         </div>
-                        <div class="w-full bg-gray-700 rounded-full h-2">
-                            <div id="progress-bar" class="bg-blue-500 h-2 rounded-full transition-all duration-300" style="width: 0%"></div>
-                        </div>
-                        <div id="progress-status" class="text-sm text-gray-400 mt-2">Waiting...</div>
-                    </div>
-
-                    <!-- Result Section -->
-                    <div id="result-section" class="mt-6 hidden">
-                        <div class="bg-gray-700 rounded p-4">
-                            <h3 class="font-medium mb-2 flex items-center gap-2">
-                                <i data-lucide="check-circle" class="w-4 h-4 text-green-500"></i>
-                                Download Complete
-                            </h3>
-                            <div id="result-details" class="text-sm space-y-1 text-gray-300"></div>
+                        <div class="w-full bg-gray-700 rounded-full h-1.5">
+                            <div id="progress-bar" class="bg-blue-500 h-1.5 rounded-full transition-all duration-300" style="width: 0%"></div>
                         </div>
                     </div>
 
-                    <!-- Error Section -->
-                    <div id="error-section" class="mt-6 hidden">
-                        <div class="bg-red-900/50 border border-red-700 rounded p-4">
-                            <h3 class="font-medium mb-2 flex items-center gap-2 text-red-400">
-                                <i data-lucide="alert-circle" class="w-4 h-4"></i>
-                                Error
-                            </h3>
-                            <div id="error-details" class="text-sm text-red-300"></div>
+                    <!-- Result -->
+                    <div id="result-section" class="mt-4 hidden">
+                        <div class="bg-green-900/30 border border-green-700 rounded p-3">
+                            <div id="result-details" class="text-xs space-y-1 text-green-300"></div>
+                        </div>
+                    </div>
+
+                    <!-- Error -->
+                    <div id="error-section" class="mt-4 hidden">
+                        <div class="bg-red-900/30 border border-red-700 rounded p-3">
+                            <div id="error-details" class="text-xs text-red-300"></div>
                         </div>
                     </div>
                 </div>
             </div>
 
-            <!-- Recent Activity / Jobs -->
+            <!-- Active Jobs -->
             <div class="bg-gray-800 rounded-lg border border-gray-700">
-                <div class="p-4 border-b border-gray-700 flex items-center justify-between">
-                    <h2 class="text-lg font-semibold flex items-center gap-2">
-                        <i data-lucide="list" class="w-5 h-5"></i>
-                        Recent Jobs
+                <div class="p-3 border-b border-gray-700 flex items-center justify-between">
+                    <h2 class="font-semibold flex items-center gap-2">
+                        <i data-lucide="activity" class="w-4 h-4"></i>
+                        Active Jobs
+                        <span id="active-jobs-count" class="text-xs bg-blue-600 px-2 py-0.5 rounded-full">0</span>
                     </h2>
-                    <button onclick="clearJobs()" class="text-sm text-gray-400 hover:text-white">Clear</button>
+                    <span class="w-2 h-2 bg-green-500 rounded-full live-indicator"></span>
                 </div>
-                <div class="p-4">
-                    <div id="jobs-list" class="space-y-3 max-h-96 overflow-y-auto">
-                        <p class="text-gray-500 text-sm text-center py-8">No jobs yet. Start a download to see activity.</p>
+                <div class="p-3">
+                    <div id="active-jobs" class="space-y-2 max-h-64 overflow-y-auto">
+                        <p class="text-gray-500 text-sm text-center py-4">No active jobs</p>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Configuration -->
+            <div class="bg-gray-800 rounded-lg border border-gray-700">
+                <div class="p-3 border-b border-gray-700">
+                    <h2 class="font-semibold flex items-center gap-2">
+                        <i data-lucide="settings" class="w-4 h-4"></i>
+                        YT-DLP Config
+                    </h2>
+                </div>
+                <div class="p-3">
+                    <div class="space-y-3">
+                        <div class="grid grid-cols-2 gap-2">
+                            <div>
+                                <label class="block text-xs text-gray-400 mb-1">Max Height</label>
+                                <select id="config-height" class="w-full bg-gray-700 border border-gray-600 rounded px-2 py-1.5 text-sm text-white">
+                                    <option value="360">360p</option>
+                                    <option value="480">480p</option>
+                                    <option value="720" selected>720p</option>
+                                    <option value="1080">1080p</option>
+                                </select>
+                            </div>
+                            <div>
+                                <label class="block text-xs text-gray-400 mb-1">Format</label>
+                                <select id="config-format" class="w-full bg-gray-700 border border-gray-600 rounded px-2 py-1.5 text-sm text-white">
+                                    <option value="mp4" selected>MP4</option>
+                                    <option value="webm">WebM</option>
+                                    <option value="any">Any</option>
+                                </select>
+                            </div>
+                        </div>
+                        <div class="grid grid-cols-2 gap-2">
+                            <div>
+                                <label class="block text-xs text-gray-400 mb-1">Retries</label>
+                                <input type="number" id="config-retries" value="3" min="1" max="10"
+                                       class="w-full bg-gray-700 border border-gray-600 rounded px-2 py-1.5 text-sm text-white">
+                            </div>
+                            <div>
+                                <label class="block text-xs text-gray-400 mb-1">Concurrent Frags</label>
+                                <input type="number" id="config-fragments" value="1" min="1" max="10"
+                                       class="w-full bg-gray-700 border border-gray-600 rounded px-2 py-1.5 text-sm text-white">
+                            </div>
+                        </div>
+                        <div>
+                            <label class="block text-xs text-gray-400 mb-1">Rate Limit (e.g., 50M)</label>
+                            <input type="text" id="config-rate" placeholder="No limit"
+                                   class="w-full bg-gray-700 border border-gray-600 rounded px-2 py-1.5 text-sm text-white">
+                        </div>
+                        <div class="flex items-center gap-4">
+                            <label class="flex items-center gap-2 text-sm">
+                                <input type="checkbox" id="config-geo" checked class="rounded">
+                                <span class="text-gray-300">Geo Bypass</span>
+                            </label>
+                        </div>
+                        <button onclick="saveConfig()"
+                                class="w-full bg-gray-700 hover:bg-gray-600 text-white font-medium py-2 px-4 rounded text-sm flex items-center justify-center gap-2 transition">
+                            <i data-lucide="save" class="w-4 h-4"></i>
+                            Save Configuration
+                        </button>
                     </div>
                 </div>
             </div>
         </div>
 
-        <!-- Quick Stats -->
-        <div class="mt-6 bg-gray-800 rounded-lg border border-gray-700">
-            <div class="p-4 border-b border-gray-700">
-                <h2 class="text-lg font-semibold flex items-center gap-2">
-                    <i data-lucide="bar-chart-2" class="w-5 h-5"></i>
-                    Session Statistics
+        <!-- Logs Section -->
+        <div class="bg-gray-800 rounded-lg border border-gray-700 mb-6">
+            <div class="p-3 border-b border-gray-700 flex items-center justify-between">
+                <h2 class="font-semibold flex items-center gap-2">
+                    <i data-lucide="terminal" class="w-4 h-4"></i>
+                    System Logs
+                    <span class="w-2 h-2 bg-green-500 rounded-full live-indicator"></span>
                 </h2>
+                <div class="flex items-center gap-2">
+                    <label class="flex items-center gap-2 text-sm text-gray-400">
+                        <input type="checkbox" id="auto-scroll" checked class="rounded">
+                        Auto-scroll
+                    </label>
+                    <button onclick="clearLogs()" class="text-xs text-gray-400 hover:text-white">Clear</button>
+                </div>
             </div>
-            <div class="p-4 grid grid-cols-2 md:grid-cols-4 gap-4">
-                <div class="text-center">
-                    <div id="stat-total" class="text-3xl font-bold text-blue-400">0</div>
-                    <div class="text-sm text-gray-400">Total Jobs</div>
-                </div>
-                <div class="text-center">
-                    <div id="stat-success" class="text-3xl font-bold text-green-400">0</div>
-                    <div class="text-sm text-gray-400">Successful</div>
-                </div>
-                <div class="text-center">
-                    <div id="stat-failed" class="text-3xl font-bold text-red-400">0</div>
-                    <div class="text-sm text-gray-400">Failed</div>
-                </div>
-                <div class="text-center">
-                    <div id="stat-bytes" class="text-3xl font-bold text-purple-400">0 MB</div>
-                    <div class="text-sm text-gray-400">Total Downloaded</div>
+            <div id="logs-container" class="p-3 bg-gray-900">
+                <div id="logs-content" class="space-y-0.5">
+                    <p class="text-gray-500 text-sm text-center py-4">Connecting to log stream...</p>
                 </div>
             </div>
         </div>
 
-        <!-- System Info -->
-        <div class="mt-6 text-center text-gray-500 text-sm">
-            <p>SafePlay YT-DLP Service • <span id="server-time">--</span></p>
+        <!-- Recent Jobs History -->
+        <div class="bg-gray-800 rounded-lg border border-gray-700">
+            <div class="p-3 border-b border-gray-700 flex items-center justify-between">
+                <h2 class="font-semibold flex items-center gap-2">
+                    <i data-lucide="history" class="w-4 h-4"></i>
+                    Job History
+                </h2>
+                <button onclick="clearHistory()" class="text-xs text-gray-400 hover:text-white">Clear</button>
+            </div>
+            <div class="p-3">
+                <div id="jobs-history" class="space-y-2 max-h-64 overflow-y-auto">
+                    <p class="text-gray-500 text-sm text-center py-4">No completed jobs</p>
+                </div>
+            </div>
+        </div>
+
+        <!-- Stats Footer -->
+        <div class="mt-4 grid grid-cols-4 gap-3 text-center">
+            <div class="bg-gray-800 rounded p-3">
+                <div id="stat-total" class="text-2xl font-bold text-blue-400">0</div>
+                <div class="text-xs text-gray-400">Total</div>
+            </div>
+            <div class="bg-gray-800 rounded p-3">
+                <div id="stat-success" class="text-2xl font-bold text-green-400">0</div>
+                <div class="text-xs text-gray-400">Success</div>
+            </div>
+            <div class="bg-gray-800 rounded p-3">
+                <div id="stat-failed" class="text-2xl font-bold text-red-400">0</div>
+                <div class="text-xs text-gray-400">Failed</div>
+            </div>
+            <div class="bg-gray-800 rounded p-3">
+                <div id="stat-bytes" class="text-2xl font-bold text-purple-400">0 MB</div>
+                <div class="text-xs text-gray-400">Downloaded</div>
+            </div>
         </div>
     </div>
 
@@ -196,101 +492,236 @@ ADMIN_HTML = """
         lucide.createIcons();
 
         // State
-        let jobs = JSON.parse(localStorage.getItem('safeplay_jobs') || '[]');
+        let ws = null;
+        let reconnectAttempts = 0;
+        let logs = [];
+        let jobHistory = JSON.parse(localStorage.getItem('safeplay_history') || '[]');
         let stats = JSON.parse(localStorage.getItem('safeplay_stats') || '{"total":0,"success":0,"failed":0,"bytes":0}');
-        let pollInterval = null;
+        let currentJobId = null;
 
         // Load saved API key
         document.getElementById('api-key').value = localStorage.getItem('safeplay_api_key') || '';
-
-        // Save API key on change
         document.getElementById('api-key').addEventListener('change', (e) => {
             localStorage.setItem('safeplay_api_key', e.target.value);
         });
 
-        // Fetch health status
+        function toggleApiKey() {
+            const section = document.getElementById('api-key-section');
+            const text = document.getElementById('api-key-toggle-text');
+            section.classList.toggle('hidden');
+            text.textContent = section.classList.contains('hidden') ? 'Show API Key' : 'Hide API Key';
+        }
+
+        // WebSocket connection
+        function connectWebSocket() {
+            const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+            ws = new WebSocket(`${protocol}//${window.location.host}/ws/admin`);
+
+            ws.onopen = () => {
+                updateWsStatus(true);
+                reconnectAttempts = 0;
+                addLocalLog('INFO', 'Connected to real-time updates');
+            };
+
+            ws.onclose = () => {
+                updateWsStatus(false);
+                // Reconnect with exponential backoff
+                const delay = Math.min(1000 * Math.pow(2, reconnectAttempts), 30000);
+                reconnectAttempts++;
+                setTimeout(connectWebSocket, delay);
+            };
+
+            ws.onerror = () => {
+                updateWsStatus(false);
+            };
+
+            ws.onmessage = (event) => {
+                const data = JSON.parse(event.data);
+                handleWsMessage(data);
+            };
+        }
+
+        function updateWsStatus(connected) {
+            const el = document.getElementById('ws-status');
+            if (connected) {
+                el.innerHTML = '<span class="w-2 h-2 bg-green-500 rounded-full live-indicator"></span><span class="text-sm text-green-400">Live</span>';
+            } else {
+                el.innerHTML = '<span class="w-2 h-2 bg-red-500 rounded-full"></span><span class="text-sm text-red-400">Disconnected</span>';
+            }
+        }
+
+        function handleWsMessage(data) {
+            if (data.type === 'update') {
+                // Update active jobs
+                updateActiveJobs(data.jobs);
+
+                // Update logs
+                if (data.logs) {
+                    data.logs.forEach(log => {
+                        if (!logs.find(l => l.timestamp === log.timestamp && l.message === log.message)) {
+                            logs.push(log);
+                            appendLogEntry(log);
+                        }
+                    });
+                }
+
+                document.getElementById('server-time').textContent = new Date(data.timestamp).toLocaleTimeString();
+            } else if (data.type === 'log') {
+                logs.push(data);
+                appendLogEntry(data);
+            }
+        }
+
+        function updateActiveJobs(jobs) {
+            const container = document.getElementById('active-jobs');
+            const count = Object.keys(jobs).length;
+            document.getElementById('active-jobs-count').textContent = count;
+
+            if (count === 0) {
+                container.innerHTML = '<p class="text-gray-500 text-sm text-center py-4">No active jobs</p>';
+                return;
+            }
+
+            container.innerHTML = Object.entries(jobs).map(([jobId, job]) => `
+                <div class="bg-gray-700 rounded p-2">
+                    <div class="flex items-center justify-between">
+                        <span class="font-mono text-xs truncate max-w-32">${jobId}</span>
+                        <span class="text-xs px-2 py-0.5 rounded ${getStatusClass(job.status)}">${job.status}</span>
+                    </div>
+                    <div class="mt-1">
+                        <div class="w-full bg-gray-600 rounded-full h-1">
+                            <div class="bg-blue-500 h-1 rounded-full transition-all" style="width: ${job.progress}%"></div>
+                        </div>
+                        <span class="text-xs text-gray-400">${job.progress}%</span>
+                    </div>
+                </div>
+            `).join('');
+
+            // Update current job progress if matching
+            if (currentJobId && jobs[currentJobId]) {
+                const job = jobs[currentJobId];
+                updateProgress(job.progress, job.status);
+            }
+        }
+
+        function appendLogEntry(log) {
+            const container = document.getElementById('logs-content');
+
+            // Remove placeholder if present
+            if (container.querySelector('p.text-gray-500')) {
+                container.innerHTML = '';
+            }
+
+            const entry = document.createElement('div');
+            entry.className = `log-entry log-${log.level}`;
+            const time = new Date(log.timestamp).toLocaleTimeString();
+            entry.innerHTML = `<span class="text-gray-500">${time}</span> <span class="font-semibold">[${log.level}]</span> ${log.message}`;
+            container.appendChild(entry);
+
+            // Auto-scroll
+            if (document.getElementById('auto-scroll').checked) {
+                const logsContainer = document.getElementById('logs-container');
+                logsContainer.scrollTop = logsContainer.scrollHeight;
+            }
+
+            // Limit displayed logs
+            while (container.children.length > 200) {
+                container.removeChild(container.firstChild);
+            }
+        }
+
+        function addLocalLog(level, message) {
+            const log = {
+                timestamp: new Date().toISOString(),
+                level: level,
+                message: message
+            };
+            logs.push(log);
+            appendLogEntry(log);
+        }
+
+        function clearLogs() {
+            logs = [];
+            document.getElementById('logs-content').innerHTML = '<p class="text-gray-500 text-sm text-center py-4">Logs cleared</p>';
+        }
+
+        // Health check
         async function fetchHealth() {
             try {
                 const response = await fetch('/health');
                 const data = await response.json();
 
                 document.getElementById('service-status').textContent = data.status.toUpperCase();
-                document.getElementById('service-status').className = 'text-2xl font-bold mt-2 ' +
+                document.getElementById('service-status').className = 'text-lg font-bold ' +
                     (data.status === 'ok' ? 'status-ok' : 'status-error');
 
                 updateCheckStatus('ytdlp-status', data.checks.ytdlp, 'available');
                 updateCheckStatus('supabase-status', data.checks.supabase, 'connected');
                 updateCheckStatus('proxy-status', data.checks.proxy, ['configured', 'reachable']);
-
-                document.getElementById('server-time').textContent = new Date(data.timestamp).toLocaleString();
             } catch (error) {
                 document.getElementById('service-status').textContent = 'OFFLINE';
-                document.getElementById('service-status').className = 'text-2xl font-bold mt-2 status-error';
+                document.getElementById('service-status').className = 'text-lg font-bold status-error';
             }
+        }
+
+        async function fetchSystemInfo() {
+            const apiKey = document.getElementById('api-key').value;
+            if (!apiKey) return;
+
+            try {
+                const response = await fetch('/api/admin/system', {
+                    headers: { 'X-API-Key': apiKey }
+                });
+                if (response.ok) {
+                    const data = await response.json();
+                    document.getElementById('disk-free').textContent = data.disk.free_gb + ' GB';
+                    document.getElementById('disk-free').className = 'text-lg font-bold ' +
+                        (data.disk.percent_used > 90 ? 'status-error' : 'status-ok');
+                    document.getElementById('memory-used').textContent = data.memory.percent_used + '%';
+                    document.getElementById('memory-used').className = 'text-lg font-bold ' +
+                        (data.memory.percent_used > 90 ? 'status-error' : 'status-ok');
+                }
+            } catch (e) {}
         }
 
         function updateCheckStatus(elementId, value, goodValues) {
             const el = document.getElementById(elementId);
             const isGood = Array.isArray(goodValues) ? goodValues.includes(value) : value === goodValues;
             el.textContent = value ? value.toUpperCase() : 'UNKNOWN';
-            el.className = 'text-2xl font-bold mt-2 ' + (isGood ? 'status-ok' : 'status-error');
+            el.className = 'text-lg font-bold ' + (isGood ? 'status-ok' : 'status-error');
         }
 
-        // Extract YouTube ID from URL or ID
+        // Download
         function extractVideoId(input) {
             input = input.trim();
-
-            // Already an ID
-            if (/^[a-zA-Z0-9_-]{11}$/.test(input)) {
-                return input;
-            }
-
-            // URL patterns
+            if (/^[a-zA-Z0-9_-]{11}$/.test(input)) return input;
             const patterns = [
                 /(?:youtube\\.com\\/watch\\?v=|youtu\\.be\\/|youtube\\.com\\/embed\\/)([a-zA-Z0-9_-]{11})/,
                 /youtube\\.com\\/shorts\\/([a-zA-Z0-9_-]{11})/
             ];
-
             for (const pattern of patterns) {
                 const match = input.match(pattern);
                 if (match) return match[1];
             }
-
-            return input; // Return as-is, let server validate
+            return input;
         }
 
-        // Start download
         async function startDownload() {
             const apiKey = document.getElementById('api-key').value;
             const input = document.getElementById('youtube-input').value;
 
-            if (!apiKey) {
-                showError('Please enter your API key');
-                return;
-            }
-
-            if (!input) {
-                showError('Please enter a YouTube URL or video ID');
-                return;
-            }
+            if (!apiKey) { showError('Please enter your API key'); return; }
+            if (!input) { showError('Please enter a YouTube URL or video ID'); return; }
 
             const videoId = extractVideoId(input);
-            const jobId = 'job-' + Date.now();
+            currentJobId = 'job-' + Date.now();
 
-            // Reset UI
             hideResults();
             showProgress();
             updateProgress(0, 'Starting download...');
+            document.getElementById('download-btn').disabled = true;
 
-            // Add to jobs list
-            const job = {
-                id: jobId,
-                videoId: videoId,
-                status: 'pending',
-                startTime: new Date().toISOString(),
-                progress: 0
-            };
-            addJob(job);
+            addLocalLog('INFO', `Starting download: ${videoId} (${currentJobId})`);
 
             try {
                 const response = await fetch('/api/download', {
@@ -301,7 +732,7 @@ ADMIN_HTML = """
                     },
                     body: JSON.stringify({
                         youtube_id: videoId,
-                        job_id: jobId
+                        job_id: currentJobId
                     })
                 });
 
@@ -310,7 +741,8 @@ ADMIN_HTML = """
                 if (response.ok && data.status === 'success') {
                     updateProgress(100, 'Complete!');
                     showSuccess(data);
-                    updateJob(jobId, 'success', data);
+                    addToHistory(currentJobId, videoId, 'success', data);
+                    addLocalLog('SUCCESS', `Download complete: ${data.title} (${formatBytes(data.filesize_bytes)})`);
                     stats.success++;
                     stats.bytes += data.filesize_bytes || 0;
                 } else {
@@ -318,16 +750,18 @@ ADMIN_HTML = """
                 }
             } catch (error) {
                 showError(error.message);
-                updateJob(jobId, 'failed', { error: error.message });
+                addToHistory(currentJobId, videoId, 'failed', { error: error.message });
+                addLocalLog('ERROR', `Download failed: ${error.message}`);
                 stats.failed++;
             }
 
             stats.total++;
             saveStats();
             updateStatsDisplay();
+            document.getElementById('download-btn').disabled = false;
+            currentJobId = null;
         }
 
-        // Progress UI
         function showProgress() {
             document.getElementById('progress-section').classList.remove('hidden');
         }
@@ -347,10 +781,9 @@ ADMIN_HTML = """
             document.getElementById('result-section').classList.remove('hidden');
             document.getElementById('result-details').innerHTML = `
                 <p><strong>Title:</strong> ${data.title || 'Unknown'}</p>
-                <p><strong>Video ID:</strong> ${data.youtube_id}</p>
                 <p><strong>Duration:</strong> ${formatDuration(data.duration_seconds)}</p>
-                <p><strong>File Size:</strong> ${formatBytes(data.filesize_bytes)}</p>
-                <p><strong>Storage Path:</strong> ${data.storage_path}</p>
+                <p><strong>Size:</strong> ${formatBytes(data.filesize_bytes)}</p>
+                <p><strong>Path:</strong> ${data.storage_path}</p>
             `;
         }
 
@@ -359,69 +792,93 @@ ADMIN_HTML = """
             document.getElementById('error-details').textContent = message;
         }
 
-        // Jobs management
-        function addJob(job) {
-            jobs.unshift(job);
-            if (jobs.length > 50) jobs = jobs.slice(0, 50);
-            saveJobs();
-            renderJobs();
-        }
+        // Config
+        async function saveConfig() {
+            const apiKey = document.getElementById('api-key').value;
+            if (!apiKey) { alert('Please enter your API key'); return; }
 
-        function updateJob(jobId, status, data) {
-            const job = jobs.find(j => j.id === jobId);
-            if (job) {
-                job.status = status;
-                job.endTime = new Date().toISOString();
-                job.data = data;
-                saveJobs();
-                renderJobs();
+            const config = {
+                max_height: parseInt(document.getElementById('config-height').value),
+                format_preference: document.getElementById('config-format').value,
+                retries: parseInt(document.getElementById('config-retries').value),
+                concurrent_fragments: parseInt(document.getElementById('config-fragments').value),
+                rate_limit: document.getElementById('config-rate').value || null,
+                geo_bypass: document.getElementById('config-geo').checked
+            };
+
+            try {
+                const response = await fetch('/api/admin/config', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'X-API-Key': apiKey
+                    },
+                    body: JSON.stringify(config)
+                });
+
+                if (response.ok) {
+                    addLocalLog('SUCCESS', 'Configuration saved');
+                } else {
+                    throw new Error('Failed to save config');
+                }
+            } catch (error) {
+                addLocalLog('ERROR', 'Failed to save configuration: ' + error.message);
             }
         }
 
-        function renderJobs() {
-            const container = document.getElementById('jobs-list');
+        // History
+        function addToHistory(jobId, videoId, status, data) {
+            jobHistory.unshift({
+                id: jobId,
+                videoId: videoId,
+                status: status,
+                data: data,
+                timestamp: new Date().toISOString()
+            });
+            if (jobHistory.length > 50) jobHistory = jobHistory.slice(0, 50);
+            localStorage.setItem('safeplay_history', JSON.stringify(jobHistory));
+            renderHistory();
+        }
 
-            if (jobs.length === 0) {
-                container.innerHTML = '<p class="text-gray-500 text-sm text-center py-8">No jobs yet. Start a download to see activity.</p>';
+        function renderHistory() {
+            const container = document.getElementById('jobs-history');
+            if (jobHistory.length === 0) {
+                container.innerHTML = '<p class="text-gray-500 text-sm text-center py-4">No completed jobs</p>';
                 return;
             }
-
-            container.innerHTML = jobs.map(job => `
-                <div class="bg-gray-700 rounded p-3">
+            container.innerHTML = jobHistory.map(job => `
+                <div class="bg-gray-700 rounded p-2">
                     <div class="flex items-center justify-between">
-                        <span class="font-mono text-sm">${job.videoId}</span>
-                        <span class="text-xs px-2 py-1 rounded ${getStatusClass(job.status)}">${job.status.toUpperCase()}</span>
+                        <span class="font-mono text-xs">${job.videoId}</span>
+                        <span class="text-xs px-2 py-0.5 rounded ${getStatusClass(job.status)}">${job.status}</span>
                     </div>
                     <div class="text-xs text-gray-400 mt-1">
-                        ${new Date(job.startTime).toLocaleString()}
+                        ${new Date(job.timestamp).toLocaleString()}
                         ${job.data?.title ? ' • ' + job.data.title : ''}
                     </div>
-                    ${job.data?.filesize_bytes ? '<div class="text-xs text-gray-500 mt-1">' + formatBytes(job.data.filesize_bytes) + '</div>' : ''}
-                    ${job.data?.error ? '<div class="text-xs text-red-400 mt-1">' + job.data.error + '</div>' : ''}
+                    ${job.data?.filesize_bytes ? '<div class="text-xs text-gray-500">' + formatBytes(job.data.filesize_bytes) + '</div>' : ''}
+                    ${job.data?.error ? '<div class="text-xs text-red-400">' + job.data.error + '</div>' : ''}
                 </div>
             `).join('');
         }
 
-        function getStatusClass(status) {
-            switch(status) {
-                case 'success': return 'bg-green-600';
-                case 'failed': return 'bg-red-600';
-                case 'pending': return 'bg-yellow-600';
-                default: return 'bg-gray-600';
-            }
-        }
-
-        function clearJobs() {
-            jobs = [];
+        function clearHistory() {
+            jobHistory = [];
             stats = { total: 0, success: 0, failed: 0, bytes: 0 };
-            saveJobs();
-            saveStats();
-            renderJobs();
+            localStorage.setItem('safeplay_history', '[]');
+            localStorage.setItem('safeplay_stats', JSON.stringify(stats));
+            renderHistory();
             updateStatsDisplay();
         }
 
-        function saveJobs() {
-            localStorage.setItem('safeplay_jobs', JSON.stringify(jobs));
+        function getStatusClass(status) {
+            switch(status) {
+                case 'success': case 'completed': return 'bg-green-600';
+                case 'failed': return 'bg-red-600';
+                case 'downloading': case 'uploading': return 'bg-blue-600';
+                case 'pending': return 'bg-yellow-600';
+                default: return 'bg-gray-600';
+            }
         }
 
         function saveStats() {
@@ -435,7 +892,6 @@ ADMIN_HTML = """
             document.getElementById('stat-bytes').textContent = formatBytes(stats.bytes);
         }
 
-        // Utilities
         function formatBytes(bytes) {
             if (!bytes) return '0 B';
             const k = 1024;
@@ -452,9 +908,12 @@ ADMIN_HTML = """
         }
 
         // Initialize
+        connectWebSocket();
         fetchHealth();
-        setInterval(fetchHealth, 10000); // Refresh health every 10s
-        renderJobs();
+        fetchSystemInfo();
+        setInterval(fetchHealth, 10000);
+        setInterval(fetchSystemInfo, 30000);
+        renderHistory();
         updateStatsDisplay();
     </script>
 </body>
