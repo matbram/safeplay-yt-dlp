@@ -248,9 +248,9 @@ async def _download_single_attempt(
     ydl_opts = {
         **proxy_config,
         "outtmpl": str(temp_dir / f"{youtube_id}.%(ext)s"),
-        # Audio only - much smaller files, perfect for transcription
-        # m4a preferred (AAC codec), fallback to any best audio
-        "format": "bestaudio[ext=m4a]/bestaudio",
+        # Lowest quality audio - sufficient for transcription, smallest files
+        # ~48kbps vs ~128kbps = 3x smaller files
+        "format": "worstaudio",
         "progress_hooks": [lambda d: _progress_hook(d, job_id)],
         "verbose": True,
         "logger": ytdlp_logger,
