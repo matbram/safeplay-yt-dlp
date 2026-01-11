@@ -263,8 +263,9 @@ async def _download_single_attempt(
         **proxy_config,
         "outtmpl": str(temp_dir / f"{youtube_id}.%(ext)s"),
         # Lowest quality audio - sufficient for transcription, smallest files
-        # ~48kbps vs ~128kbps = 3x smaller files
-        "format": "worstaudio",
+        # Prefer English audio, fall back to original/any if not available
+        # YouTube videos often have multiple dubbed audio tracks
+        "format": "worstaudio[language=en]/worstaudio[language^=en]/worstaudio",
         "progress_hooks": [lambda d: _progress_hook(d, job_id)],
         "verbose": True,
         "logger": ytdlp_logger,
@@ -278,6 +279,12 @@ async def _download_single_attempt(
         "concurrent_fragment_downloads": 8,
         "buffersize": 1024 * 64,
         "http_chunk_size": 10485760,
+        # Prefer original/English audio track
+        "extractor_args": {
+            "youtube": {
+                "lang": ["en", "en-US", "en-GB"],  # Prefer English
+            }
+        },
     }
 
     # Enable Node.js for YouTube bot challenge solving
