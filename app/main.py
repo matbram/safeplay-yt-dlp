@@ -6,7 +6,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import settings
-from app.routes import download, status, health
+from app.routes import download, status, health, admin
 
 
 @asynccontextmanager
@@ -64,6 +64,7 @@ app.add_middleware(
 app.include_router(download.router)
 app.include_router(status.router)
 app.include_router(health.router)
+app.include_router(admin.router)
 
 
 @app.get("/", include_in_schema=False)
