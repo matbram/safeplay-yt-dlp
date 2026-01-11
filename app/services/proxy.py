@@ -15,21 +15,19 @@ PROXY_COUNTRY = "US"
 
 def get_proxy_config() -> dict:
     """
-    Get optimized proxy configuration for yt-dlp.
-    Uses US-based proxy for faster YouTube CDN routing.
+    Get proxy configuration for yt-dlp.
 
     Returns:
         dict: Proxy configuration options for yt-dlp
     """
-    # OxyLabs format for country targeting:
-    # customer-USERNAME-cc-COUNTRY:PASSWORD@pr.oxylabs.io:7777
-    # Note: OXYLABS_USERNAME already contains "customer-" prefix
+    # Standard residential proxy format (working)
+    # Note: Country targeting requires different format per proxy type
     proxy_url = (
-        f"http://{settings.OXYLABS_USERNAME}-cc-{PROXY_COUNTRY}"
-        f":{settings.OXYLABS_PASSWORD}@pr.oxylabs.io:7777"
+        f"http://{settings.OXYLABS_USERNAME}:{settings.OXYLABS_PASSWORD}"
+        f"@pr.oxylabs.io:7777"
     )
 
-    logger.debug(f"Proxy configured: US residential via pr.oxylabs.io:7777", "proxy")
+    logger.debug(f"Proxy configured: residential via pr.oxylabs.io:7777", "proxy")
 
     return {
         "proxy": proxy_url,
