@@ -5,7 +5,6 @@ import os
 import subprocess
 from datetime import datetime
 from typing import Optional
-from collections import deque
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Depends, HTTPException
 from fastapi.responses import HTMLResponse
@@ -14,27 +13,10 @@ from pydantic import BaseModel
 from app.config import settings
 from app.middleware.auth import verify_api_key
 from app.services.youtube import job_progress
+from app.services import logger
 
 
 router = APIRouter(tags=["admin"])
-
-
-# In-memory log buffer (last 500 lines)
-log_buffer = deque(maxlen=500)
-
-
-def add_log(level: str, message: str):
-    """Add a log entry to the buffer."""
-    timestamp = datetime.utcnow().isoformat() + "Z"
-    log_buffer.append({
-        "timestamp": timestamp,
-        "level": level,
-        "message": message
-    })
-
-
-# Initialize with startup message
-add_log("INFO", "Admin dashboard initialized")
 
 
 class YtdlpConfig(BaseModel):
@@ -64,15 +46,44 @@ async def update_config(config: YtdlpConfig, api_key: str = Depends(verify_api_k
     """Update yt-dlp configuration."""
     global current_config
     current_config = config
-    add_log("INFO", f"Configuration updated: max_height={config.max_height}, format={config.format_preference}")
+    logger.info(f"Configuration updated: max_height={config.max_height}, format={config.format_preference}", "admin")
     return current_config
 
 
 @router.get("/api/admin/logs")
-async def get_logs(limit: int = 100, api_key: str = Depends(verify_api_key)):
-    """Get recent logs."""
-    logs = list(log_buffer)[-limit:]
+async def get_logs(
+    limit: int = 100,
+    category: Optional[str] = None,
+    level: Optional[str] = None,
+    api_key: str = Depends(verify_api_key)
+):
+    """Get recent logs from server-side storage."""
+    logs = logger.get_logs(limit=limit, category=category, level=level)
     return {"logs": logs}
+
+
+@router.get("/api/admin/logs/file")
+async def get_logs_from_file(
+    limit: int = 500,
+    category: Optional[str] = None,
+    api_key: str = Depends(verify_api_key)
+):
+    """Get logs from persistent file storage."""
+    logs = logger.get_logs_from_file(limit=limit, category=category)
+    return {"logs": logs}
+
+
+@router.delete("/api/admin/logs")
+async def clear_logs(api_key: str = Depends(verify_api_key)):
+    """Clear all logs."""
+    logger.clear_logs()
+    return {"status": "cleared"}
+
+
+@router.get("/api/admin/logs/stats")
+async def get_logs_stats(api_key: str = Depends(verify_api_key)):
+    """Get log statistics."""
+    return logger.get_log_stats()
 
 
 @router.get("/api/admin/jobs")
@@ -146,34 +157,35 @@ async def websocket_endpoint(websocket: WebSocket):
     """WebSocket endpoint for real-time updates."""
     await websocket.accept()
     connected_clients.append(websocket)
-    add_log("INFO", f"WebSocket client connected. Total clients: {len(connected_clients)}")
+    logger.info(f"WebSocket client connected. Total clients: {len(connected_clients)}", "admin")
 
     try:
         while True:
             # Send updates every second
             await asyncio.sleep(1)
 
-            # Get current state
+            # Get current state with server-side logs
             data = {
                 "type": "update",
                 "timestamp": datetime.utcnow().isoformat() + "Z",
                 "jobs": dict(job_progress),
-                "logs": list(log_buffer)[-20:]  # Last 20 logs
+                "logs": logger.get_logs(limit=50)  # Last 50 logs from server
             }
 
             await websocket.send_json(data)
 
     except WebSocketDisconnect:
         connected_clients.remove(websocket)
-        add_log("INFO", f"WebSocket client disconnected. Total clients: {len(connected_clients)}")
+        logger.info(f"WebSocket client disconnected. Total clients: {len(connected_clients)}", "admin")
     except Exception as e:
         if websocket in connected_clients:
             connected_clients.remove(websocket)
 
 
-async def broadcast_log(level: str, message: str):
+async def broadcast_log(level: str, message: str, category: str = "admin"):
     """Broadcast a log message to all connected clients."""
-    add_log(level, message)
+    # Log to server-side storage
+    logger.log(level, message, category)
 
     for client in connected_clients:
         try:
@@ -181,6 +193,7 @@ async def broadcast_log(level: str, message: str):
                 "type": "log",
                 "timestamp": datetime.utcnow().isoformat() + "Z",
                 "level": level,
+                "category": category,
                 "message": message
             })
         except:
@@ -205,6 +218,12 @@ ADMIN_HTML = """
         .log-WARN { color: #fbbf24; }
         .log-ERROR { color: #f87171; }
         .log-SUCCESS { color: #4ade80; }
+        .log-DEBUG { color: #a78bfa; }
+        .cat-ytdlp { background: #1e40af22; border-left: 2px solid #3b82f6; }
+        .cat-proxy { background: #065f4622; border-left: 2px solid #10b981; }
+        .cat-storage { background: #7c2d1222; border-left: 2px solid #ef4444; }
+        .cat-download { background: #78350f22; border-left: 2px solid #f59e0b; }
+        .cat-admin { background: #3f3f4622; border-left: 2px solid #9ca3af; }
         .pulse { animation: pulse 2s infinite; }
         @keyframes pulse {
             0%, 100% { opacity: 1; }
@@ -429,24 +448,49 @@ ADMIN_HTML = """
 
         <!-- Logs Section -->
         <div class="bg-gray-800 rounded-lg border border-gray-700 mb-6">
-            <div class="p-3 border-b border-gray-700 flex items-center justify-between">
+            <div class="p-3 border-b border-gray-700 flex items-center justify-between flex-wrap gap-2">
                 <h2 class="font-semibold flex items-center gap-2">
                     <i data-lucide="terminal" class="w-4 h-4"></i>
                     System Logs
                     <span class="w-2 h-2 bg-green-500 rounded-full live-indicator"></span>
+                    <span class="text-xs text-gray-400 font-normal">(server-side persistent)</span>
                 </h2>
-                <div class="flex items-center gap-2">
+                <div class="flex items-center gap-3">
+                    <select id="log-category-filter" class="bg-gray-700 border border-gray-600 rounded px-2 py-1 text-xs text-white">
+                        <option value="">All Categories</option>
+                        <option value="ytdlp">yt-dlp</option>
+                        <option value="proxy">proxy</option>
+                        <option value="storage">storage</option>
+                        <option value="download">download</option>
+                        <option value="admin">admin</option>
+                        <option value="general">general</option>
+                    </select>
+                    <select id="log-level-filter" class="bg-gray-700 border border-gray-600 rounded px-2 py-1 text-xs text-white">
+                        <option value="">All Levels</option>
+                        <option value="DEBUG">DEBUG</option>
+                        <option value="INFO">INFO</option>
+                        <option value="WARN">WARN</option>
+                        <option value="ERROR">ERROR</option>
+                        <option value="SUCCESS">SUCCESS</option>
+                    </select>
                     <label class="flex items-center gap-2 text-sm text-gray-400">
                         <input type="checkbox" id="auto-scroll" checked class="rounded">
                         Auto-scroll
                     </label>
-                    <button onclick="clearLogs()" class="text-xs text-gray-400 hover:text-white">Clear</button>
+                    <button onclick="refreshLogs()" class="text-xs text-gray-400 hover:text-white px-2 py-1 bg-gray-700 rounded">
+                        <i data-lucide="refresh-cw" class="w-3 h-3 inline"></i> Refresh
+                    </button>
+                    <button onclick="clearServerLogs()" class="text-xs text-red-400 hover:text-red-300 px-2 py-1 bg-gray-700 rounded">Clear All</button>
                 </div>
             </div>
             <div id="logs-container" class="p-3 bg-gray-900">
                 <div id="logs-content" class="space-y-0.5">
-                    <p class="text-gray-500 text-sm text-center py-4">Connecting to log stream...</p>
+                    <p class="text-gray-500 text-sm text-center py-4">Loading logs from server...</p>
                 </div>
+            </div>
+            <div class="p-2 border-t border-gray-700 flex items-center justify-between text-xs text-gray-500">
+                <span id="log-count">0 logs</span>
+                <span id="log-storage-info">Logs stored at: /var/log/safeplay/service.jsonl</span>
             </div>
         </div>
 
@@ -494,13 +538,96 @@ ADMIN_HTML = """
         // State
         let ws = null;
         let reconnectAttempts = 0;
-        let logs = [];
+        let serverLogs = [];  // Logs from server
+        let seenLogKeys = new Set();  // Track seen logs to avoid duplicates
         let jobHistory = JSON.parse(localStorage.getItem('safeplay_history') || '[]');
         let stats = JSON.parse(localStorage.getItem('safeplay_stats') || '{"total":0,"success":0,"failed":0,"bytes":0}');
         let currentJobId = null;
 
         // Load saved API key
         document.getElementById('api-key').value = localStorage.getItem('safeplay_api_key') || '';
+
+        // Fetch logs from server
+        async function fetchServerLogs() {
+            const apiKey = document.getElementById('api-key').value;
+            if (!apiKey) return;
+
+            const category = document.getElementById('log-category-filter').value;
+            const level = document.getElementById('log-level-filter').value;
+
+            let url = `/api/admin/logs?limit=200`;
+            if (category) url += `&category=${category}`;
+            if (level) url += `&level=${level}`;
+
+            try {
+                const response = await fetch(url, {
+                    headers: { 'X-API-Key': apiKey }
+                });
+                if (response.ok) {
+                    const data = await response.json();
+                    renderServerLogs(data.logs);
+                }
+            } catch (e) {
+                console.error('Failed to fetch logs:', e);
+            }
+        }
+
+        function renderServerLogs(logs) {
+            const container = document.getElementById('logs-content');
+            serverLogs = logs;
+            seenLogKeys.clear();
+
+            if (logs.length === 0) {
+                container.innerHTML = '<p class="text-gray-500 text-sm text-center py-4">No logs found. Start a download to see activity.</p>';
+                document.getElementById('log-count').textContent = '0 logs';
+                return;
+            }
+
+            container.innerHTML = '';
+            logs.forEach(log => {
+                const key = `${log.timestamp}-${log.message}`;
+                seenLogKeys.add(key);
+                appendLogEntry(log);
+            });
+
+            document.getElementById('log-count').textContent = `${logs.length} logs`;
+
+            // Scroll to bottom
+            if (document.getElementById('auto-scroll').checked) {
+                const logsContainer = document.getElementById('logs-container');
+                logsContainer.scrollTop = logsContainer.scrollHeight;
+            }
+        }
+
+        async function refreshLogs() {
+            await fetchServerLogs();
+        }
+
+        async function clearServerLogs() {
+            const apiKey = document.getElementById('api-key').value;
+            if (!apiKey) { alert('Please enter your API key'); return; }
+
+            if (!confirm('Clear all server logs? This cannot be undone.')) return;
+
+            try {
+                const response = await fetch('/api/admin/logs', {
+                    method: 'DELETE',
+                    headers: { 'X-API-Key': apiKey }
+                });
+                if (response.ok) {
+                    serverLogs = [];
+                    seenLogKeys.clear();
+                    document.getElementById('logs-content').innerHTML = '<p class="text-gray-500 text-sm text-center py-4">Logs cleared</p>';
+                    document.getElementById('log-count').textContent = '0 logs';
+                }
+            } catch (e) {
+                alert('Failed to clear logs: ' + e.message);
+            }
+        }
+
+        // Filter change handlers
+        document.getElementById('log-category-filter').addEventListener('change', fetchServerLogs);
+        document.getElementById('log-level-filter').addEventListener('change', fetchServerLogs);
         document.getElementById('api-key').addEventListener('change', (e) => {
             localStorage.setItem('safeplay_api_key', e.target.value);
         });
@@ -555,20 +682,35 @@ ADMIN_HTML = """
                 // Update active jobs
                 updateActiveJobs(data.jobs);
 
-                // Update logs
+                // Update logs from server (only show new ones)
                 if (data.logs) {
+                    const category = document.getElementById('log-category-filter').value;
+                    const level = document.getElementById('log-level-filter').value;
+
                     data.logs.forEach(log => {
-                        if (!logs.find(l => l.timestamp === log.timestamp && l.message === log.message)) {
-                            logs.push(log);
+                        const key = `${log.timestamp}-${log.message}`;
+                        // Apply filters
+                        if (category && log.category !== category) return;
+                        if (level && log.level !== level) return;
+
+                        if (!seenLogKeys.has(key)) {
+                            seenLogKeys.add(key);
+                            serverLogs.push(log);
                             appendLogEntry(log);
+                            document.getElementById('log-count').textContent = `${serverLogs.length} logs`;
                         }
                     });
                 }
 
                 document.getElementById('server-time').textContent = new Date(data.timestamp).toLocaleTimeString();
             } else if (data.type === 'log') {
-                logs.push(data);
-                appendLogEntry(data);
+                const key = `${data.timestamp}-${data.message}`;
+                if (!seenLogKeys.has(key)) {
+                    seenLogKeys.add(key);
+                    serverLogs.push(data);
+                    appendLogEntry(data);
+                    document.getElementById('log-count').textContent = `${serverLogs.length} logs`;
+                }
             }
         }
 
@@ -613,9 +755,11 @@ ADMIN_HTML = """
             }
 
             const entry = document.createElement('div');
-            entry.className = `log-entry log-${log.level}`;
+            const category = log.category || 'general';
+            entry.className = `log-entry log-${log.level} cat-${category} pl-2 py-0.5`;
             const time = new Date(log.timestamp).toLocaleTimeString();
-            entry.innerHTML = `<span class="text-gray-500">${time}</span> <span class="font-semibold">[${log.level}]</span> ${log.message}`;
+            const catBadge = `<span class="text-gray-600 text-[10px]">[${category}]</span>`;
+            entry.innerHTML = `<span class="text-gray-500">${time}</span> ${catBadge} <span class="font-semibold">[${log.level}]</span> ${escapeHtml(log.message)}`;
             container.appendChild(entry);
 
             // Auto-scroll
@@ -625,24 +769,30 @@ ADMIN_HTML = """
             }
 
             // Limit displayed logs
-            while (container.children.length > 200) {
+            while (container.children.length > 300) {
                 container.removeChild(container.firstChild);
             }
         }
 
-        function addLocalLog(level, message) {
+        function escapeHtml(text) {
+            const div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
+        }
+
+        function addLocalLog(level, message, category = 'admin') {
             const log = {
                 timestamp: new Date().toISOString(),
                 level: level,
+                category: category,
                 message: message
             };
-            logs.push(log);
-            appendLogEntry(log);
-        }
-
-        function clearLogs() {
-            logs = [];
-            document.getElementById('logs-content').innerHTML = '<p class="text-gray-500 text-sm text-center py-4">Logs cleared</p>';
+            const key = `${log.timestamp}-${log.message}`;
+            if (!seenLogKeys.has(key)) {
+                seenLogKeys.add(key);
+                serverLogs.push(log);
+                appendLogEntry(log);
+            }
         }
 
         // Health check
@@ -911,10 +1061,14 @@ ADMIN_HTML = """
         connectWebSocket();
         fetchHealth();
         fetchSystemInfo();
+        fetchServerLogs();  // Load server-side logs on page load
         setInterval(fetchHealth, 10000);
         setInterval(fetchSystemInfo, 30000);
         renderHistory();
         updateStatsDisplay();
+
+        // Re-initialize lucide icons for dynamically added elements
+        setInterval(() => lucide.createIcons(), 2000);
     </script>
 </body>
 </html>
