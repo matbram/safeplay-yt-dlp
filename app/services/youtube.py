@@ -27,6 +27,10 @@ from app.utils.exceptions import (
     PERMANENT_ERRORS,
 )
 
+# === VIDEO RESTRICTION DETECTION ===
+# Age limit threshold - YouTube uses 18 for age-restricted content
+AGE_RESTRICTION_THRESHOLD = 18
+
 # === RELIABILITY CONFIGURATION ===
 DOWNLOAD_TIMEOUT_SECONDS = 180  # Max time for a single download attempt (3 min for large files + ffmpeg)
 MAX_RETRY_ATTEMPTS = 5  # Number of retry attempts (increased for bot detection)
@@ -189,6 +193,141 @@ def _is_bot_detection_error(error_msg: str) -> bool:
     """Check if the error is a bot detection error."""
     error_lower = error_msg.lower()
     return "confirm you're not a bot" in error_lower or "confirm your not a bot" in error_lower
+
+
+async def check_video_restrictions(youtube_id: str, job_id: str) -> Optional[dict]:
+    """
+    Early check for video restrictions BEFORE attempting download.
+
+    This is much faster than failing during download because it only fetches
+    metadata without downloading any media. Detects:
+    - Age-restricted content (requires sign-in)
+    - Private videos
+    - Unavailable videos
+    - Live streams
+    - Premium/members-only content
+
+    Args:
+        youtube_id: YouTube video ID
+        job_id: Job tracking ID for logging
+
+    Returns:
+        None if video is downloadable, or dict with restriction info if blocked
+
+    Raises:
+        Appropriate exception for permanent restrictions
+    """
+    url = f"https://www.youtube.com/watch?v={youtube_id}"
+
+    logger.info(
+        f"Checking video restrictions: {youtube_id}",
+        "download",
+        {"job_id": job_id, "youtube_id": youtube_id}
+    )
+
+    # Use proxy for metadata check too (some restrictions are geo-based)
+    proxy_session_id = f"check-{job_id}-{uuid.uuid4().hex[:8]}"
+    proxy_config = get_proxy_config(proxy_session_id)
+
+    ydl_opts = {
+        **proxy_config,
+        "quiet": True,
+        "no_warnings": True,
+        "skip_download": True,
+        "extract_flat": False,  # We need full info for age_limit
+        "socket_timeout": 15,
+    }
+
+    def _blocking_check():
+        """Run blocking metadata extraction."""
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            return ydl.extract_info(url, download=False)
+
+    try:
+        loop = asyncio.get_event_loop()
+        info = await asyncio.wait_for(
+            loop.run_in_executor(_download_executor, _blocking_check),
+            timeout=30  # 30 second timeout for metadata check
+        )
+
+        # Check for age restriction
+        age_limit = info.get("age_limit", 0)
+        if age_limit and age_limit >= AGE_RESTRICTION_THRESHOLD:
+            logger.warn(
+                f"Age-restricted video detected: {youtube_id} (age_limit={age_limit})",
+                "download",
+                {"job_id": job_id, "youtube_id": youtube_id, "age_limit": age_limit}
+            )
+            raise AgeRestrictedError(
+                f"Video is age-restricted (age_limit={age_limit}). "
+                "YouTube requires sign-in to verify age for this content."
+            )
+
+        # Check for live stream
+        is_live = info.get("is_live", False)
+        was_live = info.get("was_live", False)
+        if is_live:
+            logger.warn(
+                f"Live stream detected: {youtube_id}",
+                "download",
+                {"job_id": job_id, "youtube_id": youtube_id}
+            )
+            raise LiveStreamError("This is a live stream and cannot be processed until it ends.")
+
+        # Check for premium/members-only content
+        availability = info.get("availability", "")
+        if availability in ("premium_only", "subscriber_only"):
+            logger.warn(
+                f"Premium content detected: {youtube_id} (availability={availability})",
+                "download",
+                {"job_id": job_id, "youtube_id": youtube_id, "availability": availability}
+            )
+            raise PremiumContentError(
+                f"Video requires YouTube Premium or channel membership (availability={availability})."
+            )
+
+        # Video is accessible - return metadata for potential use
+        logger.debug(
+            f"Video is accessible: {youtube_id}",
+            "download",
+            {
+                "job_id": job_id,
+                "youtube_id": youtube_id,
+                "title": info.get("title", "Unknown"),
+                "duration": info.get("duration", 0),
+                "age_limit": age_limit,
+            }
+        )
+
+        return {
+            "accessible": True,
+            "title": info.get("title"),
+            "duration": info.get("duration"),
+            "age_limit": age_limit,
+        }
+
+    except yt_dlp.utils.DownloadError as e:
+        error_msg = str(e)
+        logger.warn(
+            f"Video restriction check failed: {error_msg[:100]}",
+            "download",
+            {"job_id": job_id, "youtube_id": youtube_id}
+        )
+        # Classify the error and raise appropriate exception
+        raise _classify_error(error_msg)
+
+    except asyncio.TimeoutError:
+        # Metadata check timed out - don't block on this, let download try
+        logger.warn(
+            f"Video restriction check timed out, proceeding with download",
+            "download",
+            {"job_id": job_id, "youtube_id": youtube_id}
+        )
+        return {"accessible": True, "check_timed_out": True}
+
+    except PERMANENT_ERRORS:
+        # Re-raise permanent errors (already classified)
+        raise
 
 
 def _classify_error(error_msg: str) -> Exception:
@@ -360,6 +499,7 @@ async def download_video(youtube_id: str, job_id: str) -> dict:
     Download YouTube video with automatic retries and timeouts.
 
     Features:
+    - Early restriction detection (age-restricted, private, premium, live)
     - 60 second timeout per attempt (fail fast)
     - Up to 5 retry attempts with new proxy sessions
     - Escalating backoff (1s, 2s, 5s, 10s) between retries
@@ -381,6 +521,16 @@ async def download_video(youtube_id: str, job_id: str) -> dict:
         "download",
         {"job_id": job_id, "youtube_id": youtube_id, "max_attempts": MAX_RETRY_ATTEMPTS}
     )
+
+    # === EARLY RESTRICTION CHECK ===
+    # Check for age-restricted, private, premium, or live content BEFORE downloading.
+    # This fails fast with a clear error instead of wasting time on doomed downloads.
+    try:
+        job_progress[job_id]["status"] = "checking"
+        await check_video_restrictions(youtube_id, job_id)
+    except PERMANENT_ERRORS:
+        # Re-raise permanent errors - these won't be fixed by retrying
+        raise
 
     last_error = None
     total_start = time.time()

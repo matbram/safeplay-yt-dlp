@@ -66,7 +66,11 @@ class AgeRestrictedError(SafePlayError):
             message=message,
             error_code="AGE_RESTRICTED",
             retryable=False,
-            user_message="This video requires age verification and cannot be processed.",
+            user_message=(
+                "This video is age-restricted by YouTube and cannot be filtered. "
+                "YouTube requires users to sign in and verify their age to view this content. "
+                "SafePlay cannot access age-restricted videos."
+            ),
         )
 
 
