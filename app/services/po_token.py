@@ -1,302 +1,168 @@
-"""Proof-of-Origin (PO) Token Manager for YouTube downloads.
+"""Proof-of-Origin (PO) Token Provider Status for YouTube downloads.
 
-This module manages PO tokens that allow direct YouTube downloads without
-needing residential proxies. PO tokens prove to YouTube that we're a
-legitimate browser client, bypassing IP-binding restrictions.
+The bgutil-ytdlp-pot-provider plugin handles PO tokens automatically through
+yt-dlp's plugin system. This module checks if the bgutil HTTP server is
+available so we know whether Tier 1 downloads will work.
 
-Token Lifecycle:
-- Tokens are fetched using bgutil-ytdlp-pot-provider
-- Tokens are cached in memory with TTL (default 6 hours)
-- Tokens are automatically refreshed before expiration
-- If token fetch fails, downloads fall back to proxy method
+Setup:
+    1. Install bgutil-ytdlp-pot-provider (in requirements.txt)
+    2. Run the bgutil server: docker run -d -p 4416:4416 brainicism/bgutil-ytdlp-pot-provider
+    3. yt-dlp will automatically use the plugin
+
+This module provides:
+    - Server availability checking
+    - Status reporting for admin dashboard
 """
 
-import asyncio
-import subprocess
 import time
 from dataclasses import dataclass
 from typing import Optional
 from threading import Lock
+import urllib.request
+import urllib.error
+import json
 
 from app.services import logger
 
 
-# Token configuration
-TOKEN_TTL_SECONDS = 6 * 60 * 60  # 6 hours (tokens typically valid longer, but refresh often)
-TOKEN_REFRESH_BUFFER = 30 * 60  # Refresh 30 minutes before expiration
-TOKEN_FETCH_TIMEOUT = 60  # 60 seconds to fetch a token
+# bgutil server configuration
+BGUTIL_SERVER_URL = "http://127.0.0.1:4416"
+BGUTIL_PING_TIMEOUT = 5  # seconds
+SERVER_CHECK_INTERVAL = 60  # Re-check server availability every 60 seconds
 
 
 @dataclass
 class CachedToken:
-    """A cached PO token with expiration tracking."""
-    token: str
-    visitor_data: str
-    fetched_at: float
-    expires_at: float
-
-    def is_valid(self) -> bool:
-        """Check if token is still valid (not expired)."""
-        return time.time() < self.expires_at
-
-    def needs_refresh(self) -> bool:
-        """Check if token should be refreshed soon."""
-        return time.time() > (self.expires_at - TOKEN_REFRESH_BUFFER)
+    """Placeholder for compatibility - tokens are managed by yt-dlp plugin."""
+    token: str = ""
+    visitor_data: str = ""
+    fetched_at: float = 0
+    expires_at: float = 0
 
 
 class POTokenManager:
     """
-    Manages Proof-of-Origin tokens for YouTube downloads.
+    Manages status of the bgutil PO token server.
 
-    PO tokens allow direct downloads without IP-binding restrictions.
-    This manager handles:
-    - Token fetching via bgutil-ytdlp-pot-provider
-    - Token caching with automatic refresh
-    - Thread-safe token access
-
-    Usage:
-        token_manager = POTokenManager()
-        token = await token_manager.get_token()
-        if token:
-            # Use token for yt-dlp: --extractor-args "youtube:player-client=web;po_token=web.gvs+{token}"
+    The actual PO token generation is handled by the bgutil-ytdlp-pot-provider
+    plugin which yt-dlp loads automatically. This manager just checks if the
+    server is available so we know whether Tier 1 downloads will work.
     """
 
     def __init__(self):
-        self._cached_token: Optional[CachedToken] = None
         self._lock = Lock()
-        self._fetching = False
-        self._pot_provider_available: Optional[bool] = None
+        self._server_available: Optional[bool] = None
+        self._server_version: Optional[str] = None
+        self._last_check: float = 0
 
-    def _check_pot_provider(self) -> bool:
-        """Check if bgutil-ytdlp-pot-provider is available."""
-        if self._pot_provider_available is not None:
-            return self._pot_provider_available
+    def _check_server(self) -> bool:
+        """Check if bgutil HTTP server is running and responding."""
+        now = time.time()
+
+        # Use cached result if recent
+        with self._lock:
+            if self._server_available is not None and (now - self._last_check) < SERVER_CHECK_INTERVAL:
+                return self._server_available
 
         try:
-            # Try to import the provider
-            result = subprocess.run(
-                ["python3", "-c", "import bgutil_ytdlp_pot_provider; print('ok')"],
-                capture_output=True,
-                text=True,
-                timeout=10
+            req = urllib.request.Request(
+                f"{BGUTIL_SERVER_URL}/ping",
+                headers={"User-Agent": "safeplay-ytdlp"}
             )
-            self._pot_provider_available = result.returncode == 0 and "ok" in result.stdout
+            with urllib.request.urlopen(req, timeout=BGUTIL_PING_TIMEOUT) as response:
+                data = json.loads(response.read().decode())
+                version = data.get("version", "unknown")
 
-            if self._pot_provider_available:
-                logger.info("PO token provider (bgutil) is available", "po_token")
-            else:
+                with self._lock:
+                    self._server_available = True
+                    self._server_version = version
+                    self._last_check = now
+
+                # Only log on state change
+                if self._server_available != True:
+                    logger.info(
+                        f"bgutil PO token server available (v{version}) - Tier 1 downloads enabled",
+                        "po_token"
+                    )
+
+                return True
+
+        except urllib.error.URLError as e:
+            with self._lock:
+                was_available = self._server_available
+                self._server_available = False
+                self._server_version = None
+                self._last_check = now
+
+            # Only log on state change
+            if was_available != False:
                 logger.warn(
-                    "PO token provider not available - Tier 1 downloads disabled",
-                    "po_token",
-                    {"stderr": result.stderr[:200] if result.stderr else "none"}
+                    f"bgutil server not reachable at {BGUTIL_SERVER_URL} - Tier 1 downloads disabled. "
+                    f"Run: sudo bash deployment/setup-bgutil.sh",
+                    "po_token"
                 )
-        except Exception as e:
-            self._pot_provider_available = False
-            logger.warn(
-                f"Failed to check PO token provider: {str(e)[:100]}",
-                "po_token"
-            )
+            return False
 
-        return self._pot_provider_available
+        except Exception as e:
+            with self._lock:
+                self._server_available = False
+                self._server_version = None
+                self._last_check = now
+
+            logger.warn(f"Error checking bgutil server: {str(e)[:100]}", "po_token")
+            return False
+
+    def is_available(self) -> bool:
+        """Check if PO token generation is available."""
+        return self._check_server()
 
     async def get_token(self) -> Optional[CachedToken]:
         """
-        Get a valid PO token, fetching a new one if needed.
+        Check if PO token generation is available.
 
-        Returns:
-            CachedToken if available, None if token fetch failed
+        Returns a placeholder CachedToken if server is available, None otherwise.
+        The actual token generation is handled by yt-dlp's plugin system.
         """
-        # Check if provider is available
-        if not self._check_pot_provider():
-            return None
-
-        # Check if we have a valid cached token
-        with self._lock:
-            if self._cached_token and self._cached_token.is_valid():
-                # Check if we should background refresh
-                if self._cached_token.needs_refresh() and not self._fetching:
-                    # Schedule background refresh
-                    asyncio.create_task(self._background_refresh())
-                return self._cached_token
-
-        # Need to fetch a new token
-        return await self._fetch_token()
-
-    async def _background_refresh(self):
-        """Refresh token in background without blocking."""
-        try:
-            await self._fetch_token()
-            logger.debug("Background token refresh completed", "po_token")
-        except Exception as e:
-            logger.warn(f"Background token refresh failed: {str(e)[:100]}", "po_token")
-
-    async def _fetch_token(self) -> Optional[CachedToken]:
-        """
-        Fetch a new PO token using bgutil-ytdlp-pot-provider.
-
-        The provider generates tokens by simulating a browser session.
-        """
-        with self._lock:
-            # Double-check if another thread already fetched
-            if self._cached_token and self._cached_token.is_valid():
-                return self._cached_token
-
-            if self._fetching:
-                # Wait for ongoing fetch
-                return self._cached_token
-
-            self._fetching = True
-
-        try:
-            logger.info("Fetching new PO token...", "po_token")
-            start_time = time.time()
-
-            # Use bgutil to generate a token
-            # The provider outputs JSON with token and visitor_data
-            result = await asyncio.get_event_loop().run_in_executor(
-                None,
-                self._run_token_fetch
-            )
-
-            if result:
-                fetch_time = time.time() - start_time
-                logger.success(
-                    f"PO token fetched successfully in {fetch_time:.1f}s",
-                    "po_token",
-                    {"token_preview": result.token[:20] + "..."}
-                )
-
-                with self._lock:
-                    self._cached_token = result
-
-                return result
-            else:
-                logger.warn("Failed to fetch PO token - will use proxy fallback", "po_token")
-                return None
-
-        except Exception as e:
-            logger.error(f"PO token fetch error: {str(e)[:100]}", "po_token")
-            return None
-
-        finally:
-            with self._lock:
-                self._fetching = False
-
-    def _run_token_fetch(self) -> Optional[CachedToken]:
-        """
-        Synchronously run the token fetch subprocess.
-
-        Uses bgutil-ytdlp-pot-provider to generate a token.
-        """
-        try:
-            # The bgutil provider can be invoked as a script or module
-            # It outputs a PO token that can be used with yt-dlp
-            cmd = [
-                "python3", "-c",
-                """
-import json
-from bgutil_ytdlp_pot_provider import generate_token
-
-try:
-    result = generate_token()
-    print(json.dumps({
-        'token': result.get('potoken', result.get('po_token', '')),
-        'visitor_data': result.get('visitor_data', result.get('visitorData', ''))
-    }))
-except Exception as e:
-    print(json.dumps({'error': str(e)}))
-"""
-            ]
-
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=TOKEN_FETCH_TIMEOUT
-            )
-
-            if result.returncode != 0:
-                logger.warn(
-                    f"Token fetch subprocess failed: {result.stderr[:200]}",
-                    "po_token"
-                )
-                return None
-
-            # Parse the output
-            import json
-            try:
-                data = json.loads(result.stdout.strip())
-            except json.JSONDecodeError:
-                logger.warn(f"Invalid token output: {result.stdout[:100]}", "po_token")
-                return None
-
-            if 'error' in data:
-                logger.warn(f"Token generation error: {data['error'][:100]}", "po_token")
-                return None
-
-            token = data.get('token', '')
-            visitor_data = data.get('visitor_data', '')
-
-            if not token:
-                logger.warn("Empty token received", "po_token")
-                return None
-
-            now = time.time()
+        if self._check_server():
+            # Return a placeholder - actual token is managed by yt-dlp plugin
             return CachedToken(
-                token=token,
-                visitor_data=visitor_data,
-                fetched_at=now,
-                expires_at=now + TOKEN_TTL_SECONDS
+                token="managed-by-ytdlp-plugin",
+                visitor_data="",
+                fetched_at=time.time(),
+                expires_at=time.time() + 3600
             )
-
-        except subprocess.TimeoutExpired:
-            logger.error(f"Token fetch timed out after {TOKEN_FETCH_TIMEOUT}s", "po_token")
-            return None
-        except Exception as e:
-            logger.error(f"Token fetch exception: {str(e)[:100]}", "po_token")
-            return None
+        return None
 
     def get_ytdlp_args(self, token: CachedToken) -> dict:
         """
-        Get yt-dlp arguments for using the PO token.
+        Get yt-dlp arguments for PO token usage.
 
-        Args:
-            token: The CachedToken to use
-
-        Returns:
-            dict of yt-dlp options
+        The bgutil plugin handles this automatically, so we just return
+        empty args. yt-dlp will use the plugin if the server is available.
         """
-        return {
-            "extractor_args": {
-                "youtube": {
-                    "player_client": ["web"],
-                    "po_token": [f"web.gvs+{token.token}"],
-                }
-            }
-        }
+        # The bgutil-ytdlp-pot-provider plugin handles everything automatically
+        # No special args needed - it just works if the server is running
+        return {}
 
     def invalidate(self):
-        """Invalidate the cached token (e.g., after a download failure)."""
+        """Force re-check of server availability."""
         with self._lock:
-            self._cached_token = None
-        logger.debug("PO token cache invalidated", "po_token")
+            self._last_check = 0
+        logger.debug("PO token server check invalidated", "po_token")
 
     def get_status(self) -> dict:
-        """Get the current token manager status."""
+        """Get the current PO token server status."""
+        self._check_server()  # Ensure we have fresh status
+
         with self._lock:
-            if self._cached_token:
-                return {
-                    "has_token": True,
-                    "is_valid": self._cached_token.is_valid(),
-                    "needs_refresh": self._cached_token.needs_refresh(),
-                    "expires_in_seconds": max(0, self._cached_token.expires_at - time.time()),
-                    "fetched_at": self._cached_token.fetched_at,
-                }
-            else:
-                return {
-                    "has_token": False,
-                    "provider_available": self._pot_provider_available,
-                }
+            return {
+                "server_available": self._server_available,
+                "server_url": BGUTIL_SERVER_URL,
+                "server_version": self._server_version,
+                "last_check": self._last_check,
+                "tier1_enabled": self._server_available == True,
+                "setup_command": "sudo bash deployment/setup-bgutil.sh" if not self._server_available else None,
+            }
 
 
 # Global token manager instance
@@ -312,5 +178,6 @@ def get_token_manager() -> POTokenManager:
 
 
 async def get_po_token() -> Optional[CachedToken]:
-    """Convenience function to get a PO token."""
+    """Check if PO token generation is available."""
     return await get_token_manager().get_token()
+

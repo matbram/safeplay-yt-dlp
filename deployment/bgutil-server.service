@@ -1,0 +1,34 @@
+[Unit]
+Description=bgutil PO Token Server for YouTube downloads
+Documentation=https://github.com/Brainicism/bgutil-ytdlp-pot-provider
+After=docker.service network-online.target
+Requires=docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+Restart=always
+RestartSec=10
+TimeoutStartSec=300
+
+# Remove any existing container (in case of unclean shutdown)
+ExecStartPre=-/usr/bin/docker stop bgutil-provider
+ExecStartPre=-/usr/bin/docker rm bgutil-provider
+
+# Pull latest image (optional, comment out if you want to pin version)
+ExecStartPre=/usr/bin/docker pull brainicism/bgutil-ytdlp-pot-provider:latest
+
+# Run the container
+ExecStart=/usr/bin/docker run \
+    --name bgutil-provider \
+    --init \
+    -p 127.0.0.1:4416:4416 \
+    --restart=no \
+    brainicism/bgutil-ytdlp-pot-provider:latest
+
+# Cleanup on stop
+ExecStop=/usr/bin/docker stop bgutil-provider
+ExecStopPost=-/usr/bin/docker rm bgutil-provider
+
+[Install]
+WantedBy=multi-user.target
