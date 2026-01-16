@@ -43,7 +43,7 @@ import yt_dlp
 from app.config import settings
 from app.services.proxy import get_proxy_config
 from app.services import logger
-from app.services.po_token import get_po_token, get_token_manager, CachedToken
+from app.services.po_token import get_token_manager
 from app.services.method_cache import (
     get_method_cache,
     DownloadMethod,
@@ -436,9 +436,12 @@ async def download_tier1_po_token(
     """
     TIER 1: Download video using PO token (no proxy needed).
 
-    Uses Proof-of-Origin tokens to prove we're a legitimate browser.
-    This bypasses YouTube's IP-binding, allowing direct downloads
-    without residential proxies.
+    Uses the bgutil-ytdlp-pot-provider plugin which automatically generates
+    PO tokens via the bgutil HTTP server. This bypasses YouTube's IP-binding,
+    allowing direct downloads without residential proxies.
+
+    Requires: bgutil server running at http://127.0.0.1:4416
+    Setup: sudo bash deployment/setup-bgutil.sh
 
     Cost: ~$0.008 per video
     Expected success rate: ~60%
@@ -459,11 +462,12 @@ async def download_tier1_po_token(
         {"job_id": job_id, "youtube_id": youtube_id, "method": "tier1_po_token"}
     )
 
-    # Get PO token
-    po_token = await get_po_token()
-    if not po_token:
+    # Check if bgutil server is available (PO token generation)
+    token_manager = get_token_manager()
+    if not token_manager.is_available():
         logger.warn(
-            f"[TIER 1] No PO token available, skipping Tier 1",
+            f"[TIER 1] bgutil server not available, skipping Tier 1. "
+            f"Run: sudo bash deployment/setup-bgutil.sh",
             "download",
             {"job_id": job_id, "youtube_id": youtube_id}
         )
@@ -471,7 +475,7 @@ async def download_tier1_po_token(
             success=False,
             youtube_id=youtube_id,
             method=DownloadMethod.TIER1_PO_TOKEN,
-            error="PO token not available"
+            error="bgutil PO token server not available"
         )
 
     method_cache.record_attempt(DownloadMethod.TIER1_PO_TOKEN)
@@ -484,10 +488,7 @@ async def download_tier1_po_token(
     # Create custom logger for yt-dlp
     ytdlp_logger = logger.YtdlpLogger(job_id)
 
-    # Get token manager's yt-dlp args
-    token_args = get_token_manager().get_ytdlp_args(po_token)
-
-    # yt-dlp options with PO token (NO PROXY)
+    # yt-dlp options WITHOUT proxy - the bgutil plugin handles PO tokens automatically
     ydl_opts = {
         "quiet": False,
         "verbose": True,
@@ -497,13 +498,10 @@ async def download_tier1_po_token(
         "format": "worstaudio[language=en]/worstaudio[language^=en]/worstaudio",
         "geo_bypass": True,
         "socket_timeout": 30,
-        # PO token configuration
-        **token_args,
+        # NO PROXY - direct download with PO token from bgutil plugin
         # Prefer English audio track
         "extractor_args": {
-            **token_args.get("extractor_args", {}),
             "youtube": {
-                **token_args.get("extractor_args", {}).get("youtube", {}),
                 "lang": ["en", "en-US", "en-GB"],
             }
         },
