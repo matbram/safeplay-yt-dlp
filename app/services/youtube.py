@@ -1,28 +1,31 @@
-"""YouTube video download service using yt-dlp with verbose logging and speed optimizations.
+"""YouTube video download service with hybrid Tier 1/Tier 2 strategy.
 
-TWO-PHASE DOWNLOAD STRATEGY (with aria2c acceleration)
-======================================================
-This service implements a two-phase download strategy for better reliability
-and faster downloads:
+HYBRID DOWNLOAD STRATEGY
+========================
+This service implements a cost-optimized hybrid download strategy:
 
-Phase 1 (Metadata Extraction via Proxy): ~700KB-1MB per video
-    - Uses yt-dlp with Oxylabs residential proxy
-    - Extracts video metadata and signed CDN URL
-    - Proxy required for bypassing geo-restrictions and bot detection
+Tier 1 (Primary - PO Token): ~$0.008/video, ~60% success rate
+    - Uses Proof-of-Origin (PO) tokens via bgutil-ytdlp-pot-provider
+    - PO tokens prove we're a legitimate browser, bypassing IP-binding
+    - Extracts URLs that work from ANY IP (no proxy needed for download)
+    - Downloads directly via aria2c (16 connections, no proxy)
+    - Best for: Most regular videos
 
-Phase 2 (aria2c Download via Same Proxy): ~3-50MB per video
-    - Downloads via aria2c with 16 parallel connections
-    - Uses SAME proxy session as Phase 1 (required due to YouTube IP-binding)
-    - Faster than single-threaded yt-dlp download
+Tier 2 (Fallback - Full Proxy): ~$0.12/video, ~100% success rate
+    - Uses Oxylabs residential proxy for extraction AND download
+    - Required when Tier 1 fails (age-restricted, region-locked, etc.)
+    - Uses aria2c through proxy (still 16 connections, but via proxy)
+    - Best for: Age-restricted, region-locked, premium content
 
-NOTE: YouTube now IP-binds CDN URLs to the proxy IP that extracted them.
-Direct downloads from a different IP return HTTP 403. Both phases must use
-the same proxy session.
+SMART CACHING:
+- Tracks which videos need Tier 2 (proxy)
+- Skips Tier 1 for videos known to require proxy
+- Reduces wasted time and API calls
 
-Benefits of this approach:
-- 16 parallel connections = faster downloads
-- Separate phases = better error handling and retry logic
-- Clean separation of metadata extraction and file download
+EXPECTED COSTS:
+- ~60% of videos use Tier 1: $0.008/video
+- ~40% of videos need Tier 2: $0.12/video
+- Blended average: ~$0.05/video (56% cheaper than always using proxy)
 """
 
 import asyncio
@@ -30,6 +33,7 @@ import shutil
 import subprocess
 import time
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Tuple
 from concurrent.futures import ThreadPoolExecutor
@@ -39,6 +43,12 @@ import yt_dlp
 from app.config import settings
 from app.services.proxy import get_proxy_config
 from app.services import logger
+from app.services.po_token import get_po_token, get_token_manager, CachedToken
+from app.services.method_cache import (
+    get_method_cache,
+    DownloadMethod,
+    FailureReason,
+)
 from app.utils.exceptions import (
     VideoUnavailableError,
     PrivateVideoError,
@@ -97,6 +107,33 @@ if NODEJS_AVAILABLE:
     logger.info("Node.js detected - will use for YouTube JS challenges", "ytdlp")
 else:
     logger.error("Node.js NOT found - YouTube downloads may fail with bot detection! Install with: apt install nodejs", "ytdlp")
+
+
+# === COST TRACKING ===
+# Estimated costs per download method
+COST_TIER1_PO_TOKEN = 0.008  # ~$0.008 per video (minimal overhead)
+COST_TIER2_PROXY = 0.12  # ~$0.12 per video (full proxy bandwidth)
+
+# Tier 1 configuration
+TIER1_TIMEOUT_SECONDS = 30  # Shorter timeout for Tier 1 (fail fast)
+TIER1_MAX_RETRIES = 2  # Fewer retries for Tier 1 (fallback to Tier 2 quickly)
+
+
+@dataclass
+class DownloadResult:
+    """Result of a video download operation."""
+    success: bool
+    file_path: Optional[str] = None
+    title: str = "Unknown"
+    duration_seconds: int = 0
+    youtube_id: str = ""
+    ext: str = "m4a"
+    filesize_bytes: int = 0
+    download_time: float = 0.0
+    method: DownloadMethod = DownloadMethod.UNKNOWN
+    cost: float = 0.0
+    error: Optional[str] = None
+    cancelled: bool = False
 
 
 # In-memory job progress tracking
@@ -389,7 +426,247 @@ def _classify_error(error_msg: str) -> Exception:
 
 
 # =============================================================================
-# PHASE 1: METADATA EXTRACTION (WITH PROXY)
+# TIER 1: PO TOKEN DOWNLOAD (NO PROXY)
+# =============================================================================
+
+async def download_tier1_po_token(
+    youtube_id: str,
+    job_id: str,
+) -> DownloadResult:
+    """
+    TIER 1: Download video using PO token (no proxy needed).
+
+    Uses Proof-of-Origin tokens to prove we're a legitimate browser.
+    This bypasses YouTube's IP-binding, allowing direct downloads
+    without residential proxies.
+
+    Cost: ~$0.008 per video
+    Expected success rate: ~60%
+
+    Args:
+        youtube_id: YouTube video ID
+        job_id: Job tracking ID
+
+    Returns:
+        DownloadResult with success status and file info
+    """
+    url = f"https://www.youtube.com/watch?v={youtube_id}"
+    method_cache = get_method_cache()
+
+    logger.info(
+        f"[TIER 1] Starting PO token download for {youtube_id}",
+        "download",
+        {"job_id": job_id, "youtube_id": youtube_id, "method": "tier1_po_token"}
+    )
+
+    # Get PO token
+    po_token = await get_po_token()
+    if not po_token:
+        logger.warn(
+            f"[TIER 1] No PO token available, skipping Tier 1",
+            "download",
+            {"job_id": job_id, "youtube_id": youtube_id}
+        )
+        return DownloadResult(
+            success=False,
+            youtube_id=youtube_id,
+            method=DownloadMethod.TIER1_PO_TOKEN,
+            error="PO token not available"
+        )
+
+    method_cache.record_attempt(DownloadMethod.TIER1_PO_TOKEN)
+    start_time = time.time()
+
+    # Create temp directory for download
+    temp_dir = Path(settings.TEMP_DIR) / job_id
+    temp_dir.mkdir(parents=True, exist_ok=True)
+
+    # Create custom logger for yt-dlp
+    ytdlp_logger = logger.YtdlpLogger(job_id)
+
+    # Get token manager's yt-dlp args
+    token_args = get_token_manager().get_ytdlp_args(po_token)
+
+    # yt-dlp options with PO token (NO PROXY)
+    ydl_opts = {
+        "quiet": False,
+        "verbose": True,
+        "logger": ytdlp_logger,
+        "outtmpl": str(temp_dir / "%(id)s.%(ext)s"),
+        # Audio format selection - prefer English, lowest quality for transcription
+        "format": "worstaudio[language=en]/worstaudio[language^=en]/worstaudio",
+        "geo_bypass": True,
+        "socket_timeout": 30,
+        # PO token configuration
+        **token_args,
+        # Prefer English audio track
+        "extractor_args": {
+            **token_args.get("extractor_args", {}),
+            "youtube": {
+                **token_args.get("extractor_args", {}).get("youtube", {}),
+                "lang": ["en", "en-US", "en-GB"],
+            }
+        },
+    }
+
+    # Enable aria2c for multi-connection download if available
+    if ARIA2C_AVAILABLE:
+        ydl_opts["external_downloader"] = "aria2c"
+        ydl_opts["external_downloader_args"] = {
+            "aria2c": [
+                "-x", "16", "-s", "16", "-k", "1M",
+                "--file-allocation=none",
+                "--max-connection-per-server=16",
+                "--min-split-size=1M", "--split=16",
+                "--timeout=30",
+            ]
+        }
+
+    # Enable Node.js for YouTube bot challenge solving
+    if NODEJS_AVAILABLE:
+        ydl_opts["js_runtimes"] = {"node": {}}
+
+    def _blocking_download():
+        """Run blocking yt-dlp download."""
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            ext = info.get("ext", "m4a")
+            output_file = temp_dir / f"{youtube_id}.{ext}"
+            filesize = output_file.stat().st_size if output_file.exists() else 0
+
+            return {
+                "info": info,
+                "ext": ext,
+                "output_file": output_file,
+                "filesize": filesize,
+                "duration": time.time() - start_time,
+            }
+
+    try:
+        # Run with timeout
+        loop = asyncio.get_event_loop()
+        download_task = loop.run_in_executor(_download_executor, _blocking_download)
+        download_result = await asyncio.wait_for(download_task, timeout=TIER1_TIMEOUT_SECONDS + DOWNLOAD_TIMEOUT_SECONDS)
+
+        info = download_result["info"]
+        download_time = download_result["duration"]
+
+        # Success!
+        method_cache.record_success(youtube_id, DownloadMethod.TIER1_PO_TOKEN)
+
+        logger.success(
+            f"[TIER 1] Download complete: {info.get('title', 'Unknown')[:50]}",
+            "download",
+            {
+                "job_id": job_id,
+                "youtube_id": youtube_id,
+                "method": "tier1_po_token",
+                "title": info.get("title", "Unknown")[:50],
+                "filesize_mb": round(download_result["filesize"] / (1024 * 1024), 2),
+                "download_time_seconds": round(download_time, 2),
+                "cost": COST_TIER1_PO_TOKEN,
+            }
+        )
+
+        return DownloadResult(
+            success=True,
+            file_path=str(download_result["output_file"]),
+            title=info.get("title", "Unknown"),
+            duration_seconds=info.get("duration", 0),
+            youtube_id=youtube_id,
+            ext=download_result["ext"],
+            filesize_bytes=download_result["filesize"],
+            download_time=download_time,
+            method=DownloadMethod.TIER1_PO_TOKEN,
+            cost=COST_TIER1_PO_TOKEN,
+        )
+
+    except asyncio.TimeoutError:
+        duration = time.time() - start_time
+        error_msg = f"Tier 1 download timed out after {duration:.1f}s"
+        logger.warn(f"[TIER 1] {error_msg}", "download", {
+            "job_id": job_id, "youtube_id": youtube_id
+        })
+        method_cache.record_failure(youtube_id, DownloadMethod.TIER1_PO_TOKEN, FailureReason.UNKNOWN)
+        return DownloadResult(
+            success=False,
+            youtube_id=youtube_id,
+            method=DownloadMethod.TIER1_PO_TOKEN,
+            error=error_msg
+        )
+
+    except yt_dlp.utils.DownloadError as e:
+        error_msg = str(e)
+        duration = time.time() - start_time
+
+        # Classify the failure reason
+        failure_reason = _classify_tier1_failure(error_msg)
+
+        logger.warn(
+            f"[TIER 1] Download failed ({failure_reason.value}): {error_msg[:100]}",
+            "download",
+            {"job_id": job_id, "youtube_id": youtube_id, "failure_reason": failure_reason.value}
+        )
+
+        method_cache.record_failure(youtube_id, DownloadMethod.TIER1_PO_TOKEN, failure_reason)
+
+        # Check if this is a permanent error that won't be fixed by Tier 2
+        classified = _classify_error(error_msg)
+        if isinstance(classified, PERMANENT_ERRORS):
+            raise classified
+
+        return DownloadResult(
+            success=False,
+            youtube_id=youtube_id,
+            method=DownloadMethod.TIER1_PO_TOKEN,
+            error=error_msg
+        )
+
+    except Exception as e:
+        error_msg = str(e)
+        duration = time.time() - start_time
+        logger.warn(
+            f"[TIER 1] Unexpected error: {error_msg[:100]}",
+            "download",
+            {"job_id": job_id, "youtube_id": youtube_id}
+        )
+        method_cache.record_failure(youtube_id, DownloadMethod.TIER1_PO_TOKEN, FailureReason.UNKNOWN)
+        return DownloadResult(
+            success=False,
+            youtube_id=youtube_id,
+            method=DownloadMethod.TIER1_PO_TOKEN,
+            error=error_msg
+        )
+
+
+def _classify_tier1_failure(error_msg: str) -> FailureReason:
+    """Classify why Tier 1 failed for caching purposes."""
+    error_lower = error_msg.lower()
+
+    if "403" in error_msg or "forbidden" in error_lower:
+        return FailureReason.IP_BINDING
+    elif "age" in error_lower and "restrict" in error_lower:
+        return FailureReason.AGE_RESTRICTED
+    elif "not available" in error_lower and ("country" in error_lower or "region" in error_lower):
+        return FailureReason.REGION_LOCKED
+    elif "sign in" in error_lower or "bot" in error_lower or "confirm" in error_lower:
+        return FailureReason.BOT_DETECTION
+    elif "token" in error_lower and ("expired" in error_lower or "invalid" in error_lower):
+        return FailureReason.TOKEN_EXPIRED
+    elif "format" in error_lower and "not available" in error_lower:
+        return FailureReason.FORMAT_UNAVAILABLE
+    else:
+        return FailureReason.UNKNOWN
+
+
+# =============================================================================
+# TIER 2: PROXY DOWNLOAD (PHASE 1 + PHASE 2)
+# =============================================================================
+# The existing extract_audio_url and download_from_cdn functions form Tier 2.
+# They use the Oxylabs residential proxy for both extraction and download.
+
+# =============================================================================
+# TIER 2 - PHASE 1: METADATA EXTRACTION (WITH PROXY)
 # =============================================================================
 
 async def extract_audio_url(
@@ -951,38 +1228,46 @@ async def _download_single_attempt(
 
 async def download_video(youtube_id: str, job_id: str) -> dict:
     """
-    Download YouTube video using cost-optimized two-phase strategy.
+    Download YouTube video using HYBRID Tier 1/Tier 2 strategy.
 
-    COST OPTIMIZATION: ~96% proxy bandwidth reduction
-    =================================================
-    Phase 1 (via proxy): Extract metadata + signed CDN URL (~700KB-1MB)
-    Phase 2 (direct):    Download audio from CDN (3-50MB, NO PROXY)
+    COST-OPTIMIZED HYBRID APPROACH
+    ==============================
+    Tier 1 (Primary - PO Token): ~$0.008/video, ~60% success rate
+        - Uses Proof-of-Origin tokens to bypass IP-binding
+        - Direct download via aria2c (no proxy needed)
+        - Fastest and cheapest option
+
+    Tier 2 (Fallback - Full Proxy): ~$0.12/video, ~100% success rate
+        - Uses Oxylabs residential proxy for extraction AND download
+        - Required for age-restricted, region-locked, etc.
+        - Same proxy session for both phases (IP-bound URLs)
 
     Features:
+    - Smart caching: Skips Tier 1 for videos known to require Tier 2
     - Early restriction detection (age-restricted, private, premium, live)
-    - Phase 1 retries with new proxy sessions on failure
-    - Phase 2 retries by refreshing CDN URL (re-running Phase 1)
-    - Special handling for bot detection: longer delays + circuit breaker
-    - Immediate failure for permanent errors (video unavailable, private, etc.)
+    - Automatic fallback from Tier 1 to Tier 2 on failure
+    - Cost tracking per download
+
+    Expected blended cost: ~$0.05/video (56% cheaper than always using proxy)
 
     Args:
         youtube_id: YouTube video ID
         job_id: Job ID for tracking
 
     Returns:
-        dict with success status and file info
+        dict with success status, file info, method used, and cost
     """
     # Initialize progress
     job_progress[job_id] = {"status": "pending", "progress": 0, "attempt": 1}
+    method_cache = get_method_cache()
 
     logger.info(
-        f"Starting two-phase download for video: {youtube_id}",
+        f"Starting hybrid Tier 1/Tier 2 download for video: {youtube_id}",
         "download",
         {
             "job_id": job_id,
             "youtube_id": youtube_id,
-            "max_attempts": MAX_RETRY_ATTEMPTS,
-            "strategy": "proxy_metadata_only",
+            "strategy": "hybrid_tier1_tier2",
         }
     )
 
@@ -996,10 +1281,121 @@ async def download_video(youtube_id: str, job_id: str) -> dict:
         # Re-raise permanent errors - these won't be fixed by retrying
         raise
 
-    last_error = None
     total_start = time.time()
-    bot_detection_count = 0  # Track consecutive bot detections
-    metadata_result = None  # Cache metadata from Phase 1
+
+    # =================================================================
+    # TIER 1: TRY PO TOKEN DOWNLOAD (NO PROXY - CHEAPEST)
+    # =================================================================
+    # Check if we should skip Tier 1 based on previous failures
+    skip_tier1 = method_cache.should_skip_tier1(youtube_id)
+
+    if not skip_tier1:
+        # Check for cancellation
+        if is_job_cancelled(job_id):
+            return {
+                "success": False,
+                "cancelled": True,
+                "youtube_id": youtube_id,
+                "error": "Download cancelled by user",
+            }
+
+        job_progress[job_id]["status"] = "downloading"
+        job_progress[job_id]["progress"] = 10
+
+        logger.info(
+            f"[TIER 1] Attempting PO token download (no proxy)",
+            "download",
+            {"job_id": job_id, "youtube_id": youtube_id}
+        )
+
+        try:
+            tier1_result = await download_tier1_po_token(youtube_id, job_id)
+
+            if tier1_result.success:
+                # Tier 1 succeeded!
+                total_duration = time.time() - total_start
+                job_progress[job_id]["progress"] = 75
+
+                logger.success(
+                    f"[TIER 1 SUCCESS] Download complete: {tier1_result.title[:50]}",
+                    "download",
+                    {
+                        "job_id": job_id,
+                        "youtube_id": youtube_id,
+                        "title": tier1_result.title[:50],
+                        "filesize_mb": round(tier1_result.filesize_bytes / (1024 * 1024), 2),
+                        "download_time_seconds": round(tier1_result.download_time, 2),
+                        "total_time_seconds": round(total_duration, 2),
+                        "method": "tier1_po_token",
+                        "cost": COST_TIER1_PO_TOKEN,
+                    }
+                )
+
+                return {
+                    "success": True,
+                    "file_path": tier1_result.file_path,
+                    "title": tier1_result.title,
+                    "duration_seconds": tier1_result.duration_seconds,
+                    "youtube_id": youtube_id,
+                    "ext": tier1_result.ext,
+                    "filesize_bytes": tier1_result.filesize_bytes,
+                    "download_time": tier1_result.download_time,
+                    "method": "tier1_po_token",
+                    "cost": COST_TIER1_PO_TOKEN,
+                }
+
+            # Tier 1 failed (non-permanent error) - fall through to Tier 2
+            logger.info(
+                f"[TIER 1 FAILED] {tier1_result.error[:100] if tier1_result.error else 'Unknown error'}, "
+                f"falling back to Tier 2 (proxy)",
+                "download",
+                {"job_id": job_id, "youtube_id": youtube_id}
+            )
+
+        except PERMANENT_ERRORS:
+            # Re-raise permanent errors - Tier 2 won't help
+            raise
+
+        except DownloadCancelled:
+            job_progress[job_id] = {"status": "cancelled", "progress": 0, "error": "Cancelled by user"}
+            cancelled_jobs.discard(job_id)
+            return {
+                "success": False,
+                "cancelled": True,
+                "youtube_id": youtube_id,
+                "error": "Download cancelled by user",
+            }
+
+        except Exception as e:
+            # Log but continue to Tier 2
+            logger.warn(
+                f"[TIER 1] Unexpected error: {str(e)[:100]}, falling back to Tier 2",
+                "download",
+                {"job_id": job_id, "youtube_id": youtube_id}
+            )
+
+    else:
+        logger.info(
+            f"[TIER 1 SKIPPED] Video {youtube_id} known to require proxy (from cache)",
+            "download",
+            {"job_id": job_id, "youtube_id": youtube_id}
+        )
+
+    # =================================================================
+    # TIER 2: PROXY DOWNLOAD (FALLBACK)
+    # =================================================================
+    # Either Tier 1 failed or was skipped due to cache
+    logger.info(
+        f"[TIER 2] Starting proxy download for {youtube_id}",
+        "download",
+        {"job_id": job_id, "youtube_id": youtube_id}
+    )
+
+    method_cache.record_attempt(DownloadMethod.TIER2_PROXY)
+
+    last_error = None
+    bot_detection_count = 0
+    metadata_result = None
 
     for attempt in range(1, MAX_RETRY_ATTEMPTS + 1):
         # Check for cancellation
@@ -1017,7 +1413,7 @@ async def download_video(youtube_id: str, job_id: str) -> dict:
 
         # Use unique proxy session for each attempt (new IP on retry)
         # IMPORTANT: Same session ID used for BOTH phases (IP-bound URLs require this)
-        proxy_session_id = f"{job_id}-a{attempt}-{uuid.uuid4().hex[:12]}"
+        proxy_session_id = f"{job_id}-t2-a{attempt}-{uuid.uuid4().hex[:8]}"
 
         # Get proxy config once - use same proxy URL for both phases
         proxy_config = get_proxy_config(proxy_session_id)
@@ -1025,10 +1421,10 @@ async def download_video(youtube_id: str, job_id: str) -> dict:
 
         try:
             # =================================================================
-            # PHASE 1: Extract metadata + CDN URL (WITH PROXY)
+            # TIER 2 - PHASE 1: Extract metadata + CDN URL (WITH PROXY)
             # =================================================================
             logger.info(
-                f"[Attempt {attempt}] PHASE 1: Extracting metadata via proxy",
+                f"[TIER 2 - Attempt {attempt}] PHASE 1: Extracting metadata via proxy",
                 "download",
                 {"job_id": job_id, "youtube_id": youtube_id, "attempt": attempt}
             )
@@ -1037,13 +1433,13 @@ async def download_video(youtube_id: str, job_id: str) -> dict:
 
             # Update progress - metadata extracted
             job_progress[job_id]["status"] = "downloading"
-            job_progress[job_id]["progress"] = 25
+            job_progress[job_id]["progress"] = 40
 
             # =================================================================
-            # PHASE 2: Download from CDN (SAME PROXY SESSION for IP-bound URLs)
+            # TIER 2 - PHASE 2: Download from CDN (SAME PROXY SESSION)
             # =================================================================
             logger.info(
-                f"[Attempt {attempt}] PHASE 2: Downloading via aria2c (same proxy session)",
+                f"[TIER 2 - Attempt {attempt}] PHASE 2: Downloading via aria2c (same proxy session)",
                 "download",
                 {"job_id": job_id, "youtube_id": youtube_id, "attempt": attempt}
             )
@@ -1057,11 +1453,30 @@ async def download_video(youtube_id: str, job_id: str) -> dict:
                 proxy_url=proxy_url,  # Use same proxy session for IP-bound URLs
             )
 
-            # Success! Combine results and return
+            # Success! Record in cache and return
             total_duration = time.time() - total_start
             job_progress[job_id]["progress"] = 75
 
-            result = {
+            method_cache.record_success(youtube_id, DownloadMethod.TIER2_PROXY)
+
+            logger.success(
+                f"[TIER 2 SUCCESS] Download complete: {metadata_result['title'][:50]} (attempt {attempt})",
+                "download",
+                {
+                    "job_id": job_id,
+                    "youtube_id": youtube_id,
+                    "title": metadata_result["title"][:50],
+                    "filesize_mb": round(download_result["filesize_bytes"] / (1024 * 1024), 2),
+                    "download_time_seconds": round(download_result["download_time"], 2),
+                    "total_time_seconds": round(total_duration, 2),
+                    "attempts": attempt,
+                    "bot_detections": bot_detection_count,
+                    "method": "tier2_proxy",
+                    "cost": COST_TIER2_PROXY,
+                }
+            )
+
+            return {
                 "success": True,
                 "file_path": download_result["file_path"],
                 "title": metadata_result["title"],
@@ -1070,27 +1485,13 @@ async def download_video(youtube_id: str, job_id: str) -> dict:
                 "ext": metadata_result["ext"],
                 "filesize_bytes": download_result["filesize_bytes"],
                 "download_time": download_result["download_time"],
+                "method": "tier2_proxy",
+                "cost": COST_TIER2_PROXY,
             }
-
-            logger.success(
-                f"Two-phase download complete: {metadata_result['title'][:50]} (attempt {attempt})",
-                "download",
-                {
-                    "job_id": job_id,
-                    "youtube_id": youtube_id,
-                    "title": metadata_result["title"][:50],
-                    "filesize_mb": round(download_result["filesize_bytes"] / (1024 * 1024), 2),
-                    "total_time_seconds": round(total_duration, 2),
-                    "attempts": attempt,
-                    "bot_detections": bot_detection_count,
-                    "download_method": "aria2c_16_connections",
-                }
-            )
-            return result
 
         except PERMANENT_ERRORS as e:
             # Don't retry permanent errors - fail immediately
-            logger.error(f"Permanent error (no retry): {e.message}", "download", {
+            logger.error(f"[TIER 2] Permanent error (no retry): {e.message}", "download", {
                 "job_id": job_id, "error_code": e.error_code, "attempt": attempt
             })
             job_progress[job_id] = {"status": "failed", "progress": 0, "error": e.message}
@@ -1115,7 +1516,7 @@ async def download_video(youtube_id: str, job_id: str) -> dict:
                 # Use longer delays for bot detection to let proxy pool rotate
                 backoff = RETRY_BACKOFF_SECONDS[min(attempt - 1, len(RETRY_BACKOFF_SECONDS) - 1)]
                 logger.warn(
-                    f"[PHASE 1] Bot detection #{bot_detection_count} on attempt {attempt}, "
+                    f"[TIER 2] Bot detection #{bot_detection_count} on attempt {attempt}, "
                     f"retrying in {backoff}s with fresh proxy IP...",
                     "download",
                     {"job_id": job_id, "attempt": attempt, "backoff": backoff, "bot_detections": bot_detection_count}
@@ -1123,7 +1524,7 @@ async def download_video(youtube_id: str, job_id: str) -> dict:
                 await asyncio.sleep(backoff)
             else:
                 logger.warn(
-                    f"All {MAX_RETRY_ATTEMPTS} Phase 1 attempts hit bot detection, "
+                    f"[TIER 2] All {MAX_RETRY_ATTEMPTS} attempts hit bot detection, "
                     f"trying circuit breaker ({CIRCUIT_BREAKER_DELAY}s delay)...",
                     "download",
                     {"job_id": job_id, "bot_detections": bot_detection_count}
@@ -1137,15 +1538,15 @@ async def download_video(youtube_id: str, job_id: str) -> dict:
             if attempt < MAX_RETRY_ATTEMPTS:
                 backoff = RETRY_BACKOFF_SECONDS[min(attempt - 1, len(RETRY_BACKOFF_SECONDS) - 1)]
                 logger.warn(
-                    f"[PHASE 2] CDN download failed on attempt {attempt}, "
-                    f"will refresh URL via Phase 1 in {backoff}s...",
+                    f"[TIER 2] CDN download failed on attempt {attempt}, "
+                    f"will refresh URL in {backoff}s...",
                     "download",
                     {"job_id": job_id, "attempt": attempt, "backoff": backoff, "error": error_msg[:100]}
                 )
                 await asyncio.sleep(backoff)
             else:
                 logger.error(
-                    f"All {MAX_RETRY_ATTEMPTS} attempts failed for {youtube_id}",
+                    f"[TIER 2] All {MAX_RETRY_ATTEMPTS} attempts failed for {youtube_id}",
                     "download",
                     {"job_id": job_id, "youtube_id": youtube_id, "final_error": error_msg}
                 )
@@ -1158,14 +1559,14 @@ async def download_video(youtube_id: str, job_id: str) -> dict:
             if attempt < MAX_RETRY_ATTEMPTS:
                 backoff = RETRY_BACKOFF_SECONDS[min(attempt - 1, len(RETRY_BACKOFF_SECONDS) - 1)]
                 logger.warn(
-                    f"Attempt {attempt} failed, retrying in {backoff}s with fresh proxy...",
+                    f"[TIER 2] Attempt {attempt} failed, retrying in {backoff}s with fresh proxy...",
                     "download",
                     {"job_id": job_id, "attempt": attempt, "backoff": backoff, "error": error_msg[:100]}
                 )
                 await asyncio.sleep(backoff)
             else:
                 logger.error(
-                    f"All {MAX_RETRY_ATTEMPTS} attempts failed for {youtube_id}",
+                    f"[TIER 2] All {MAX_RETRY_ATTEMPTS} attempts failed for {youtube_id}",
                     "download",
                     {"job_id": job_id, "youtube_id": youtube_id, "final_error": error_msg}
                 )
@@ -1173,7 +1574,7 @@ async def download_video(youtube_id: str, job_id: str) -> dict:
     # Circuit breaker: If all attempts failed with bot detection, wait longer and try one more time
     if bot_detection_count >= MAX_RETRY_ATTEMPTS - 1:
         logger.info(
-            f"Circuit breaker activated: waiting {CIRCUIT_BREAKER_DELAY}s before final two-phase attempt",
+            f"[TIER 2] Circuit breaker activated: waiting {CIRCUIT_BREAKER_DELAY}s before final attempt",
             "download",
             {"job_id": job_id, "youtube_id": youtube_id, "bot_detections": bot_detection_count}
         )
@@ -1183,7 +1584,7 @@ async def download_video(youtube_id: str, job_id: str) -> dict:
         # Final attempt with completely fresh session
         job_progress[job_id]["attempt"] = MAX_RETRY_ATTEMPTS + 1
         job_progress[job_id]["status"] = "extracting"
-        proxy_session_id = f"circuit-{uuid.uuid4().hex}"
+        proxy_session_id = f"circuit-t2-{uuid.uuid4().hex}"
 
         # Get proxy config for circuit breaker attempt - use same proxy for both phases
         proxy_config = get_proxy_config(proxy_session_id)
@@ -1192,7 +1593,7 @@ async def download_video(youtube_id: str, job_id: str) -> dict:
         try:
             # Phase 1 with circuit breaker
             logger.info(
-                f"[Circuit Breaker] PHASE 1: Extracting metadata via fresh proxy",
+                f"[TIER 2 - Circuit Breaker] PHASE 1: Extracting metadata via fresh proxy",
                 "download",
                 {"job_id": job_id, "youtube_id": youtube_id}
             )
@@ -1202,7 +1603,7 @@ async def download_video(youtube_id: str, job_id: str) -> dict:
 
             # Phase 2 with same proxy session
             logger.info(
-                f"[Circuit Breaker] PHASE 2: Downloading via aria2c (same proxy session)",
+                f"[TIER 2 - Circuit Breaker] PHASE 2: Downloading via aria2c (same proxy session)",
                 "download",
                 {"job_id": job_id, "youtube_id": youtube_id}
             )
@@ -1212,23 +1613,14 @@ async def download_video(youtube_id: str, job_id: str) -> dict:
                 job_id=job_id,
                 ext=metadata_result["ext"],
                 title=metadata_result["title"],
-                proxy_url=proxy_url,  # Use same proxy session for IP-bound URLs
+                proxy_url=proxy_url,
             )
 
             total_duration = time.time() - total_start
-            result = {
-                "success": True,
-                "file_path": download_result["file_path"],
-                "title": metadata_result["title"],
-                "duration_seconds": metadata_result["duration_seconds"],
-                "youtube_id": youtube_id,
-                "ext": metadata_result["ext"],
-                "filesize_bytes": download_result["filesize_bytes"],
-                "download_time": download_result["download_time"],
-            }
+            method_cache.record_success(youtube_id, DownloadMethod.TIER2_PROXY)
 
             logger.success(
-                f"Circuit breaker SUCCESS: {metadata_result['title'][:50]}",
+                f"[TIER 2 - Circuit Breaker SUCCESS] {metadata_result['title'][:50]}",
                 "download",
                 {
                     "job_id": job_id,
@@ -1238,42 +1630,52 @@ async def download_video(youtube_id: str, job_id: str) -> dict:
                     "attempts": MAX_RETRY_ATTEMPTS + 1,
                     "bot_detections": bot_detection_count,
                     "circuit_breaker": True,
-                    "download_method": "aria2c_16_connections",
+                    "method": "tier2_proxy",
+                    "cost": COST_TIER2_PROXY,
                 }
             )
-            return result
+
+            return {
+                "success": True,
+                "file_path": download_result["file_path"],
+                "title": metadata_result["title"],
+                "duration_seconds": metadata_result["duration_seconds"],
+                "youtube_id": youtube_id,
+                "ext": metadata_result["ext"],
+                "filesize_bytes": download_result["filesize_bytes"],
+                "download_time": download_result["download_time"],
+                "method": "tier2_proxy",
+                "cost": COST_TIER2_PROXY,
+            }
 
         except Exception as e:
             last_error = e
             logger.error(
-                f"Circuit breaker failed for {youtube_id}",
+                f"[TIER 2] Circuit breaker failed for {youtube_id}",
                 "download",
                 {"job_id": job_id, "error": str(e)[:100]}
             )
 
     # =================================================================
-    # FALLBACK: Legacy proxy download when CDN is IP-bound
+    # FINAL FALLBACK: Legacy single-phase proxy download
     # =================================================================
-    # If all two-phase attempts failed (likely due to YouTube IP-binding CDN URLs),
-    # fall back to the legacy approach that downloads via proxy.
-    # This costs more but ensures the download succeeds.
-
+    # If Tier 2 two-phase also failed, try the legacy approach as a last resort
     logger.warn(
-        f"Two-phase download failed, falling back to legacy proxy download for {youtube_id}",
+        f"[TIER 2] Two-phase proxy failed, trying legacy single-phase download for {youtube_id}",
         "download",
-        {"job_id": job_id, "youtube_id": youtube_id, "reason": "cdn_ip_bound"}
+        {"job_id": job_id, "youtube_id": youtube_id, "reason": "two_phase_failed"}
     )
 
     # Try legacy download with fresh proxy session
     for fallback_attempt in range(1, 3):  # 2 fallback attempts
-        proxy_session_id = f"fallback-{job_id}-{uuid.uuid4().hex[:8]}"
+        proxy_session_id = f"legacy-{job_id}-{uuid.uuid4().hex[:8]}"
 
         try:
             job_progress[job_id]["status"] = "downloading"
-            job_progress[job_id]["attempt"] = MAX_RETRY_ATTEMPTS + fallback_attempt
+            job_progress[job_id]["attempt"] = MAX_RETRY_ATTEMPTS + 1 + fallback_attempt
 
             logger.info(
-                f"[FALLBACK {fallback_attempt}] Using legacy proxy download (full bandwidth via proxy)",
+                f"[LEGACY FALLBACK {fallback_attempt}] Using single-phase proxy download",
                 "download",
                 {"job_id": job_id, "youtube_id": youtube_id}
             )
@@ -1281,8 +1683,10 @@ async def download_video(youtube_id: str, job_id: str) -> dict:
             result = await _download_single_attempt(youtube_id, job_id, fallback_attempt, proxy_session_id)
 
             total_duration = time.time() - total_start
+            method_cache.record_success(youtube_id, DownloadMethod.TIER2_PROXY)
+
             logger.success(
-                f"Fallback download SUCCESS: {result.get('title', 'Unknown')[:50]}",
+                f"[LEGACY FALLBACK SUCCESS] {result.get('title', 'Unknown')[:50]}",
                 "download",
                 {
                     "job_id": job_id,
@@ -1290,14 +1694,18 @@ async def download_video(youtube_id: str, job_id: str) -> dict:
                     "title": result.get("title", "Unknown")[:50],
                     "filesize_mb": round(result.get("filesize_bytes", 0) / (1024 * 1024), 2),
                     "total_time_seconds": round(total_duration, 2),
-                    "fallback": True,
-                    "proxy_phase": "full_download",
+                    "legacy_fallback": True,
+                    "method": "tier2_proxy",
+                    "cost": COST_TIER2_PROXY,
                 }
             )
+
+            result["method"] = "tier2_proxy"
+            result["cost"] = COST_TIER2_PROXY
             return result
 
         except PERMANENT_ERRORS as e:
-            logger.error(f"Fallback hit permanent error: {e.message}", "download", {
+            logger.error(f"[LEGACY FALLBACK] Permanent error: {e.message}", "download", {
                 "job_id": job_id, "error_code": e.error_code
             })
             raise
@@ -1306,25 +1714,25 @@ async def download_video(youtube_id: str, job_id: str) -> dict:
             last_error = e
             if fallback_attempt < 2:
                 logger.warn(
-                    f"[FALLBACK {fallback_attempt}] failed, retrying...",
+                    f"[LEGACY FALLBACK {fallback_attempt}] failed, retrying...",
                     "download",
                     {"job_id": job_id, "error": str(e)[:100]}
                 )
                 await asyncio.sleep(2)
             else:
                 logger.error(
-                    f"All fallback attempts failed for {youtube_id}",
+                    f"[LEGACY FALLBACK] All attempts failed for {youtube_id}",
                     "download",
                     {"job_id": job_id, "error": str(e)[:100]}
                 )
 
-    # All retries exhausted (including fallback)
+    # All retries exhausted (Tier 1 + Tier 2 + Legacy fallback)
     total_duration = time.time() - total_start
     job_progress[job_id] = {
         "status": "failed",
         "progress": 0,
         "error": str(last_error),
-        "attempts": MAX_RETRY_ATTEMPTS + 2,
+        "attempts": MAX_RETRY_ATTEMPTS + 3,
         "bot_detections": bot_detection_count,
     }
 
@@ -1333,9 +1741,11 @@ async def download_video(youtube_id: str, job_id: str) -> dict:
         "success": False,
         "youtube_id": youtube_id,
         "error": str(last_error),
-        "attempts": MAX_RETRY_ATTEMPTS + 2,
+        "attempts": MAX_RETRY_ATTEMPTS + 3,
         "bot_detections": bot_detection_count,
         "total_time": total_duration,
+        "method": "all_failed",
+        "cost": COST_TIER1_PO_TOKEN + COST_TIER2_PROXY,  # Attempted both
     }
 
 
