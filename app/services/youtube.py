@@ -698,13 +698,20 @@ async def _download_with_aria2c(
         )
 
         if process.returncode != 0:
-            error_msg = process.stderr or process.stdout or "aria2c failed"
+            # Capture full error for debugging
+            full_error = (process.stderr or "") + (process.stdout or "")
+            # Check for HTTP 403 which indicates IP-binding
+            is_ip_bound = "403" in full_error or "Forbidden" in full_error
             logger.warn(
-                f"[PHASE 2] aria2c failed (code {process.returncode}): {error_msg[:100]}",
+                f"[PHASE 2] aria2c failed (code {process.returncode}): {full_error[:300]}",
                 "download",
-                {"job_id": job_id}
+                {"job_id": job_id, "is_ip_bound": is_ip_bound, "full_error": full_error[:500]}
             )
-            return {"success": False, "error": f"aria2c error: {error_msg[:200]}"}
+            return {
+                "success": False,
+                "error": f"aria2c error: {full_error[:200]}",
+                "is_ip_bound": is_ip_bound,
+            }
 
         if not output_file.exists():
             return {"success": False, "error": "aria2c completed but file not found"}
@@ -1198,13 +1205,80 @@ async def download_video(youtube_id: str, job_id: str) -> dict:
                 {"job_id": job_id, "error": str(e)[:100]}
             )
 
-    # All retries exhausted
+    # =================================================================
+    # FALLBACK: Legacy proxy download when CDN is IP-bound
+    # =================================================================
+    # If all two-phase attempts failed (likely due to YouTube IP-binding CDN URLs),
+    # fall back to the legacy approach that downloads via proxy.
+    # This costs more but ensures the download succeeds.
+
+    logger.warn(
+        f"Two-phase download failed, falling back to legacy proxy download for {youtube_id}",
+        "download",
+        {"job_id": job_id, "youtube_id": youtube_id, "reason": "cdn_ip_bound"}
+    )
+
+    # Try legacy download with fresh proxy session
+    for fallback_attempt in range(1, 3):  # 2 fallback attempts
+        proxy_session_id = f"fallback-{job_id}-{uuid.uuid4().hex[:8]}"
+
+        try:
+            job_progress[job_id]["status"] = "downloading"
+            job_progress[job_id]["attempt"] = MAX_RETRY_ATTEMPTS + fallback_attempt
+
+            logger.info(
+                f"[FALLBACK {fallback_attempt}] Using legacy proxy download (full bandwidth via proxy)",
+                "download",
+                {"job_id": job_id, "youtube_id": youtube_id}
+            )
+
+            result = await _download_single_attempt(youtube_id, job_id, fallback_attempt, proxy_session_id)
+
+            total_duration = time.time() - total_start
+            logger.success(
+                f"Fallback download SUCCESS: {result.get('title', 'Unknown')[:50]}",
+                "download",
+                {
+                    "job_id": job_id,
+                    "youtube_id": youtube_id,
+                    "title": result.get("title", "Unknown")[:50],
+                    "filesize_mb": round(result.get("filesize_bytes", 0) / (1024 * 1024), 2),
+                    "total_time_seconds": round(total_duration, 2),
+                    "fallback": True,
+                    "proxy_phase": "full_download",
+                }
+            )
+            return result
+
+        except PERMANENT_ERRORS as e:
+            logger.error(f"Fallback hit permanent error: {e.message}", "download", {
+                "job_id": job_id, "error_code": e.error_code
+            })
+            raise
+
+        except Exception as e:
+            last_error = e
+            if fallback_attempt < 2:
+                logger.warn(
+                    f"[FALLBACK {fallback_attempt}] failed, retrying...",
+                    "download",
+                    {"job_id": job_id, "error": str(e)[:100]}
+                )
+                await asyncio.sleep(2)
+            else:
+                logger.error(
+                    f"All fallback attempts failed for {youtube_id}",
+                    "download",
+                    {"job_id": job_id, "error": str(e)[:100]}
+                )
+
+    # All retries exhausted (including fallback)
     total_duration = time.time() - total_start
     job_progress[job_id] = {
         "status": "failed",
         "progress": 0,
         "error": str(last_error),
-        "attempts": MAX_RETRY_ATTEMPTS,
+        "attempts": MAX_RETRY_ATTEMPTS + 2,
         "bot_detections": bot_detection_count,
     }
 
@@ -1213,7 +1287,7 @@ async def download_video(youtube_id: str, job_id: str) -> dict:
         "success": False,
         "youtube_id": youtube_id,
         "error": str(last_error),
-        "attempts": MAX_RETRY_ATTEMPTS,
+        "attempts": MAX_RETRY_ATTEMPTS + 2,
         "bot_detections": bot_detection_count,
         "total_time": total_duration,
     }
