@@ -63,6 +63,12 @@ class POTokenManager:
         with self._lock:
             if self._server_available is not None and (now - self._last_check) < SERVER_CHECK_INTERVAL:
                 return self._server_available
+            was_available = self._server_available  # Capture state before check
+
+        logger.debug(
+            f"Checking bgutil server at {BGUTIL_SERVER_URL}...",
+            "po_token"
+        )
 
         try:
             req = urllib.request.Request(
@@ -78,8 +84,8 @@ class POTokenManager:
                     self._server_version = version
                     self._last_check = now
 
-                # Only log on state change
-                if self._server_available != True:
+                # Log on state change (was not True before)
+                if was_available is not True:
                     logger.info(
                         f"bgutil PO token server available (v{version}) - Tier 1 downloads enabled",
                         "po_token"
@@ -89,13 +95,12 @@ class POTokenManager:
 
         except urllib.error.URLError as e:
             with self._lock:
-                was_available = self._server_available
                 self._server_available = False
                 self._server_version = None
                 self._last_check = now
 
-            # Only log on state change
-            if was_available != False:
+            # Log on state change (was not False before)
+            if was_available is not False:
                 logger.warn(
                     f"bgutil server not reachable at {BGUTIL_SERVER_URL} - Tier 1 downloads disabled. "
                     f"Run: sudo bash deployment/setup-bgutil.sh",
