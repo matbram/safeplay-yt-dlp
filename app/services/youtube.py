@@ -1286,6 +1286,13 @@ async def download_video(youtube_id: str, job_id: str) -> dict:
             "download",
             {"job_id": job_id, "youtube_id": youtube_id, "note": "Tier1/2 will handle retries"}
         )
+    except Exception as e:
+        # Catch any other exceptions and log for debugging, then proceed
+        logger.warn(
+            f"Restriction check failed with {type(e).__name__}: {str(e)[:100]}, proceeding with download",
+            "download",
+            {"job_id": job_id, "youtube_id": youtube_id, "exception_type": type(e).__name__}
+        )
 
     total_start = time.time()
 
