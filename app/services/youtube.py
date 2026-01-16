@@ -1278,6 +1278,14 @@ async def download_video(youtube_id: str, job_id: str) -> dict:
     except PERMANENT_ERRORS:
         # Re-raise permanent errors - these won't be fixed by retrying
         raise
+    except BotDetectionError:
+        # Bot detection during restriction check is normal with proxy rotation
+        # Don't fail here - proceed with download, Tier 1/2 have proper retry logic
+        logger.warn(
+            f"Bot detection during restriction check, proceeding with download",
+            "download",
+            {"job_id": job_id, "youtube_id": youtube_id, "note": "Tier1/2 will handle retries"}
+        )
 
     total_start = time.time()
 
