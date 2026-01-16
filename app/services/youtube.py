@@ -1,21 +1,28 @@
 """YouTube video download service using yt-dlp with verbose logging and speed optimizations.
 
-COST OPTIMIZATION: Two-Phase Proxy Strategy
-============================================
-This service implements a cost-optimized download strategy that reduces proxy
-bandwidth usage by ~96%:
+TWO-PHASE DOWNLOAD STRATEGY (with aria2c acceleration)
+======================================================
+This service implements a two-phase download strategy for better reliability
+and faster downloads:
 
 Phase 1 (Metadata Extraction via Proxy): ~700KB-1MB per video
     - Uses yt-dlp with Oxylabs residential proxy
     - Extracts video metadata and signed CDN URL
     - Proxy required for bypassing geo-restrictions and bot detection
 
-Phase 2 (Direct CDN Download): ~3-50MB per video
-    - Downloads directly from Google's CDN (googlevideo.com)
-    - NO proxy - uses server's native IP
-    - CDN URLs are signed and valid for ~6 hours from any IP
+Phase 2 (aria2c Download via Same Proxy): ~3-50MB per video
+    - Downloads via aria2c with 16 parallel connections
+    - Uses SAME proxy session as Phase 1 (required due to YouTube IP-binding)
+    - Faster than single-threaded yt-dlp download
 
-This approach reduces proxy costs from ~$0.10/video to ~$0.004/video.
+NOTE: YouTube now IP-binds CDN URLs to the proxy IP that extracted them.
+Direct downloads from a different IP return HTTP 403. Both phases must use
+the same proxy session.
+
+Benefits of this approach:
+- 16 parallel connections = faster downloads
+- Separate phases = better error handling and retry logic
+- Clean separation of metadata extraction and file download
 """
 
 import asyncio
@@ -556,7 +563,7 @@ async def extract_audio_url(
 
 
 # =============================================================================
-# PHASE 2: DIRECT CDN DOWNLOAD (WITHOUT PROXY)
+# PHASE 2: CDN DOWNLOAD (with aria2c multi-connection)
 # =============================================================================
 
 async def download_from_cdn(
@@ -565,16 +572,19 @@ async def download_from_cdn(
     job_id: str,
     ext: str,
     title: str = "Unknown",
+    proxy_url: str = None,
 ) -> dict:
     """
-    PHASE 2: Download audio file directly from CDN without proxy.
+    PHASE 2: Download audio file from CDN using aria2c multi-connection.
 
-    This function downloads the file directly from Google's CDN using aria2c
-    (if available) or wget/curl fallback. No proxy is used because:
-    1. CDN URLs are signed and valid for ~6 hours from any IP
-    2. Direct download saves ~96% of proxy bandwidth costs
+    This function downloads the file from Google's CDN using aria2c for
+    fast multi-connection downloads. Due to YouTube's IP-binding, the
+    proxy_url should be the SAME proxy session used in Phase 1.
 
-    Bandwidth usage: 3-50MB per video (actual audio file, NOT proxied)
+    Benefits of this approach:
+    - 16 parallel connections for faster downloads
+    - Same proxy session ensures IP-bound URLs work
+    - Better error handling with separate phases
 
     Args:
         cdn_url: Signed CDN URL from Phase 1 (googlevideo.com)
@@ -582,6 +592,7 @@ async def download_from_cdn(
         job_id: Job tracking ID
         ext: File extension (m4a, webm, etc.)
         title: Video title for logging
+        proxy_url: Proxy URL (same session as Phase 1 for IP-bound URLs)
 
     Returns:
         dict with:
@@ -596,14 +607,16 @@ async def download_from_cdn(
     temp_dir.mkdir(parents=True, exist_ok=True)
     output_file = temp_dir / f"{youtube_id}.{ext}"
 
+    proxy_status = "via same proxy session" if proxy_url else "NO PROXY"
     logger.info(
-        f"[PHASE 2] Starting direct CDN download (NO PROXY)",
+        f"[PHASE 2] Starting CDN download ({proxy_status})",
         "download",
         {
             "job_id": job_id,
             "youtube_id": youtube_id,
             "cdn_host": cdn_url.split("/")[2] if "/" in cdn_url else "unknown",
             "output_file": str(output_file),
+            "using_proxy": bool(proxy_url),
         }
     )
 
@@ -611,19 +624,25 @@ async def download_from_cdn(
 
     if ARIA2C_AVAILABLE:
         # Use aria2c for multi-connection download (fastest)
-        result = await _download_with_aria2c(cdn_url, output_file, job_id)
+        result = await _download_with_aria2c(cdn_url, output_file, job_id, proxy_url)
     else:
-        # Fallback to wget/curl
+        # Fallback to wget/curl (doesn't support proxy in this path)
+        if proxy_url:
+            logger.warn(
+                "[PHASE 2] aria2c not available, falling back to wget/curl without proxy",
+                "download",
+                {"job_id": job_id}
+            )
         result = await _download_with_fallback(cdn_url, output_file, job_id)
 
     if not result.get("success"):
-        raise DownloadError(result.get("error", "Direct CDN download failed"))
+        raise DownloadError(result.get("error", "CDN download failed"))
 
     download_time = time.time() - start_time
     filesize = output_file.stat().st_size if output_file.exists() else 0
 
     logger.success(
-        f"[PHASE 2 COMPLETE] Direct download finished in {download_time:.1f}s (NO PROXY)",
+        f"[PHASE 2 COMPLETE] Download finished in {download_time:.1f}s ({proxy_status})",
         "download",
         {
             "job_id": job_id,
@@ -632,6 +651,7 @@ async def download_from_cdn(
             "filesize_mb": round(filesize / (1024 * 1024), 2),
             "download_time_seconds": round(download_time, 2),
             "speed_mbps": round((filesize / (1024 * 1024)) / download_time, 2) if download_time > 0 else 0,
+            "using_proxy": bool(proxy_url),
         }
     )
 
@@ -647,6 +667,7 @@ async def _download_with_aria2c(
     cdn_url: str,
     output_file: Path,
     job_id: str,
+    proxy_url: str = None,
 ) -> dict:
     """
     Download file using aria2c with multi-connection support.
@@ -655,6 +676,13 @@ async def _download_with_aria2c(
     - 16 connections per server
     - 16 concurrent segments
     - 1MB minimum segment size
+    - Optional proxy support for IP-bound YouTube URLs
+
+    Args:
+        cdn_url: The CDN URL to download from
+        output_file: Path to save the downloaded file
+        job_id: Job ID for logging
+        proxy_url: Optional proxy URL (required for IP-bound YouTube URLs)
     """
     # aria2c command with same options as existing yt-dlp integration
     cmd = [
@@ -671,13 +699,20 @@ async def _download_with_aria2c(
         "--allow-overwrite=true",
         "-d", str(output_file.parent),
         "-o", output_file.name,
-        cdn_url,
     ]
 
+    # Add proxy if provided (required for IP-bound YouTube URLs)
+    if proxy_url:
+        cmd.extend(["--all-proxy", proxy_url])
+
+    # Add URL last
+    cmd.append(cdn_url)
+
+    using_proxy = "via same proxy" if proxy_url else "no proxy"
     logger.debug(
-        f"[PHASE 2] Executing aria2c (16 connections, no proxy)",
+        f"[PHASE 2] Executing aria2c (16 connections, {using_proxy})",
         "download",
-        {"job_id": job_id, "output": str(output_file)}
+        {"job_id": job_id, "output": str(output_file), "using_proxy": bool(proxy_url)}
     )
 
     def _run_aria2c():
@@ -981,7 +1016,12 @@ async def download_video(youtube_id: str, job_id: str) -> dict:
         job_progress[job_id]["status"] = "extracting"
 
         # Use unique proxy session for each attempt (new IP on retry)
+        # IMPORTANT: Same session ID used for BOTH phases (IP-bound URLs require this)
         proxy_session_id = f"{job_id}-a{attempt}-{uuid.uuid4().hex[:12]}"
+
+        # Get proxy config once - use same proxy URL for both phases
+        proxy_config = get_proxy_config(proxy_session_id)
+        proxy_url = proxy_config.get("proxy")
 
         try:
             # =================================================================
@@ -1000,10 +1040,10 @@ async def download_video(youtube_id: str, job_id: str) -> dict:
             job_progress[job_id]["progress"] = 25
 
             # =================================================================
-            # PHASE 2: Download from CDN (WITHOUT PROXY)
+            # PHASE 2: Download from CDN (SAME PROXY SESSION for IP-bound URLs)
             # =================================================================
             logger.info(
-                f"[Attempt {attempt}] PHASE 2: Downloading from CDN (NO PROXY)",
+                f"[Attempt {attempt}] PHASE 2: Downloading via aria2c (same proxy session)",
                 "download",
                 {"job_id": job_id, "youtube_id": youtube_id, "attempt": attempt}
             )
@@ -1014,6 +1054,7 @@ async def download_video(youtube_id: str, job_id: str) -> dict:
                 job_id=job_id,
                 ext=metadata_result["ext"],
                 title=metadata_result["title"],
+                proxy_url=proxy_url,  # Use same proxy session for IP-bound URLs
             )
 
             # Success! Combine results and return
@@ -1042,7 +1083,7 @@ async def download_video(youtube_id: str, job_id: str) -> dict:
                     "total_time_seconds": round(total_duration, 2),
                     "attempts": attempt,
                     "bot_detections": bot_detection_count,
-                    "proxy_phase": "phase_1_only",
+                    "download_method": "aria2c_16_connections",
                 }
             )
             return result
@@ -1144,6 +1185,10 @@ async def download_video(youtube_id: str, job_id: str) -> dict:
         job_progress[job_id]["status"] = "extracting"
         proxy_session_id = f"circuit-{uuid.uuid4().hex}"
 
+        # Get proxy config for circuit breaker attempt - use same proxy for both phases
+        proxy_config = get_proxy_config(proxy_session_id)
+        proxy_url = proxy_config.get("proxy")
+
         try:
             # Phase 1 with circuit breaker
             logger.info(
@@ -1155,9 +1200,9 @@ async def download_video(youtube_id: str, job_id: str) -> dict:
 
             job_progress[job_id]["status"] = "downloading"
 
-            # Phase 2 direct download
+            # Phase 2 with same proxy session
             logger.info(
-                f"[Circuit Breaker] PHASE 2: Downloading from CDN (NO PROXY)",
+                f"[Circuit Breaker] PHASE 2: Downloading via aria2c (same proxy session)",
                 "download",
                 {"job_id": job_id, "youtube_id": youtube_id}
             )
@@ -1167,6 +1212,7 @@ async def download_video(youtube_id: str, job_id: str) -> dict:
                 job_id=job_id,
                 ext=metadata_result["ext"],
                 title=metadata_result["title"],
+                proxy_url=proxy_url,  # Use same proxy session for IP-bound URLs
             )
 
             total_duration = time.time() - total_start
@@ -1192,7 +1238,7 @@ async def download_video(youtube_id: str, job_id: str) -> dict:
                     "attempts": MAX_RETRY_ATTEMPTS + 1,
                     "bot_detections": bot_detection_count,
                     "circuit_breaker": True,
-                    "proxy_phase": "phase_1_only",
+                    "download_method": "aria2c_16_connections",
                 }
             )
             return result
