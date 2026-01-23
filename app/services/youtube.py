@@ -8,13 +8,13 @@ Tier 1 (Primary - PO Token): ~$0.008/video, ~60% success rate
     - Uses Proof-of-Origin (PO) tokens via bgutil-ytdlp-pot-provider
     - PO tokens prove we're a legitimate browser, bypassing IP-binding
     - Extracts URLs that work from ANY IP (no proxy needed for download)
-    - Downloads directly via aria2c (16 connections, no proxy)
+    - Downloads 240p MP4 directly via aria2c (8 connections, no proxy)
     - Best for: Most regular videos
 
 Tier 2 (Fallback - Full Proxy): ~$0.12/video, ~100% success rate
     - Uses Oxylabs residential proxy for extraction AND download
     - Required when Tier 1 fails (age-restricted, region-locked, etc.)
-    - Uses aria2c through proxy (still 16 connections, but via proxy)
+    - Downloads 240p MP4 via aria2c through proxy (8 connections)
     - Best for: Age-restricted, region-locked, premium content
 
 SMART CACHING:
@@ -127,7 +127,7 @@ class DownloadResult:
     title: str = "Unknown"
     duration_seconds: int = 0
     youtube_id: str = ""
-    ext: str = "m4a"
+    ext: str = "mp4"
     filesize_bytes: int = 0
     download_time: float = 0.0
     method: DownloadMethod = DownloadMethod.UNKNOWN
@@ -494,8 +494,9 @@ async def download_tier1_po_token(
         "verbose": True,
         "logger": ytdlp_logger,
         "outtmpl": str(temp_dir / "%(id)s.%(ext)s"),
-        # Audio format selection - prefer English, lowest quality for transcription
-        "format": "worstaudio[language=en]/worstaudio[language^=en]/worstaudio",
+        # 240p video - small files, fast downloads, sufficient for processing
+        "format": "best[protocol=https][ext=mp4]/best[protocol=https]/best",
+        "format_sort": ["res:240", "br"],
         "geo_bypass": True,
         "socket_timeout": 30,
         # NO PROXY - direct download with PO token from bgutil plugin
@@ -512,10 +513,11 @@ async def download_tier1_po_token(
         ydl_opts["external_downloader"] = "aria2c"
         ydl_opts["external_downloader_args"] = {
             "aria2c": [
-                "-x", "16", "-s", "16", "-k", "1M",
+                "-x", "8", "-s", "8", "-k", "1M",
                 "--file-allocation=none",
-                "--max-connection-per-server=16",
-                "--min-split-size=1M", "--split=16",
+                "--max-connection-per-server=8",
+                "--min-split-size=1M", "--split=8",
+                "--retry-wait=1", "--max-tries=0",
                 "--timeout=30",
             ]
         }
@@ -528,7 +530,7 @@ async def download_tier1_po_token(
         """Run blocking yt-dlp download."""
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
-            ext = info.get("ext", "m4a")
+            ext = info.get("ext", "mp4")
             output_file = temp_dir / f"{youtube_id}.{ext}"
             filesize = output_file.stat().st_size if output_file.exists() else 0
 
@@ -660,14 +662,14 @@ def _classify_tier1_failure(error_msg: str) -> FailureReason:
 # =============================================================================
 # TIER 2: PROXY DOWNLOAD (PHASE 1 + PHASE 2)
 # =============================================================================
-# The existing extract_audio_url and download_from_cdn functions form Tier 2.
+# The existing extract_video_url and download_from_cdn functions form Tier 2.
 # They use the Oxylabs residential proxy for both extraction and download.
 
 # =============================================================================
 # TIER 2 - PHASE 1: METADATA EXTRACTION (WITH PROXY)
 # =============================================================================
 
-async def extract_audio_url(
+async def extract_video_url(
     youtube_id: str,
     job_id: str,
     proxy_session_id: str,
@@ -677,7 +679,7 @@ async def extract_audio_url(
 
     This function uses yt-dlp with the Oxylabs proxy to:
     1. Fetch video metadata (title, duration, etc.)
-    2. Extract the direct download URL for the best audio format
+    2. Extract the direct download URL for the best 240p MP4 format
     3. Return all info WITHOUT downloading the actual file
 
     Bandwidth usage: ~700KB-1MB per video (metadata only)
@@ -692,7 +694,7 @@ async def extract_audio_url(
             - title: Video title
             - duration_seconds: Video duration
             - cdn_url: Signed URL for direct download (googlevideo.com)
-            - ext: File extension (m4a, webm, etc.)
+            - ext: File extension (mp4)
             - filesize_approx: Approximate file size in bytes
 
     Raises:
@@ -722,8 +724,9 @@ async def extract_audio_url(
         "logger": ytdlp_logger,
         "skip_download": True,  # CRITICAL: Don't download, just extract info
         "extract_flat": False,  # We need full format info with URLs
-        # Audio format selection - prefer English, lowest quality for transcription
-        "format": "worstaudio[language=en]/worstaudio[language^=en]/worstaudio",
+        # 240p video - small files, fast downloads, sufficient for processing
+        "format": "best[protocol=https][ext=mp4]/best[protocol=https]/best",
+        "format_sort": ["res:240", "br"],
         "geo_bypass": True,
         "socket_timeout": 30,
         # Prefer English audio track
@@ -769,29 +772,32 @@ async def extract_audio_url(
 
         # If not directly available, look in requested_formats
         if not cdn_url and info.get("requested_formats"):
-            # Get the audio format (should be first/only with worstaudio)
+            # Get the video format (prefer one with both video and audio)
             for fmt in info["requested_formats"]:
-                if fmt.get("acodec") != "none":
+                if fmt.get("url"):
                     cdn_url = fmt.get("url")
                     break
 
-        # Fallback: look in formats list for audio
+        # Fallback: look in formats list for video
         if not cdn_url and info.get("formats"):
-            # Find the worst quality audio format
-            audio_formats = [f for f in info["formats"] if f.get("acodec") != "none" and f.get("vcodec") == "none"]
-            if audio_formats:
-                # Sort by quality (filesize or tbr)
-                audio_formats.sort(key=lambda f: f.get("filesize") or f.get("tbr") or 0)
-                cdn_url = audio_formats[0].get("url")
+            # Find low quality video formats (prefer mp4 with both video and audio)
+            video_formats = [
+                f for f in info["formats"]
+                if f.get("vcodec") != "none" and f.get("ext") == "mp4"
+            ]
+            if video_formats:
+                # Sort by resolution (height) to get lowest quality
+                video_formats.sort(key=lambda f: f.get("height") or f.get("filesize") or 0)
+                cdn_url = video_formats[0].get("url")
 
         if not cdn_url:
             raise DownloadError(
                 f"Could not extract CDN URL for {youtube_id}. "
-                "No audio format URLs found in metadata."
+                "No video format URLs found in metadata."
             )
 
         # Get file extension and size
-        ext = info.get("ext", "m4a")
+        ext = info.get("ext", "mp4")
         filesize_approx = info.get("filesize") or info.get("filesize_approx") or 0
 
         logger.success(
@@ -850,14 +856,14 @@ async def download_from_cdn(
     proxy_url: str = None,
 ) -> dict:
     """
-    PHASE 2: Download audio file from CDN using aria2c multi-connection.
+    PHASE 2: Download video file from CDN using aria2c multi-connection.
 
     This function downloads the file from Google's CDN using aria2c for
     fast multi-connection downloads. Due to YouTube's IP-binding, the
     proxy_url should be the SAME proxy session used in Phase 1.
 
     Benefits of this approach:
-    - 16 parallel connections for faster downloads
+    - 8 parallel connections for faster downloads
     - Same proxy session ensures IP-bound URLs work
     - Better error handling with separate phases
 
@@ -948,8 +954,8 @@ async def _download_with_aria2c(
     Download file using aria2c with multi-connection support.
 
     Uses the same aria2c configuration as the existing yt-dlp integration:
-    - 16 connections per server
-    - 16 concurrent segments
+    - 8 connections per server
+    - 8 concurrent segments
     - 1MB minimum segment size
     - Optional proxy support for IP-bound YouTube URLs
 
@@ -962,12 +968,14 @@ async def _download_with_aria2c(
     # aria2c command with same options as existing yt-dlp integration
     cmd = [
         "aria2c",
-        "-x", "16",  # Max connections per server
-        "-s", "16",  # Split file into segments
+        "-x", "8",  # Max connections per server
+        "-s", "8",  # Split file into segments
         "-k", "1M",  # Min split size
-        "--max-connection-per-server=16",
+        "--max-connection-per-server=8",
         "--min-split-size=1M",
-        "--split=16",
+        "--split=8",
+        "--retry-wait=1",
+        "--max-tries=0",
         "--timeout=30",
         "--file-allocation=none",
         "--auto-file-renaming=false",
@@ -985,7 +993,7 @@ async def _download_with_aria2c(
 
     using_proxy = "via same proxy" if proxy_url else "no proxy"
     logger.debug(
-        f"[PHASE 2] Executing aria2c (16 connections, {using_proxy})",
+        f"[PHASE 2] Executing aria2c (8 connections, {using_proxy})",
         "download",
         {"job_id": job_id, "output": str(output_file), "using_proxy": bool(proxy_url)}
     )
@@ -1131,10 +1139,9 @@ async def _download_single_attempt(
     ydl_opts = {
         **proxy_config,
         "outtmpl": str(temp_dir / f"{youtube_id}.%(ext)s"),
-        # Lowest quality audio - sufficient for transcription, smallest files
-        # Prefer English audio, fall back to original/any if not available
-        # YouTube videos often have multiple dubbed audio tracks
-        "format": "worstaudio[language=en]/worstaudio[language^=en]/worstaudio",
+        # 240p video - small files, fast downloads, sufficient for processing
+        "format": "best[protocol=https][ext=mp4]/best[protocol=https]/best",
+        "format_sort": ["res:240", "br"],
         "progress_hooks": [lambda d: _progress_hook(d, job_id)],
         "verbose": True,
         "logger": ytdlp_logger,
@@ -1165,10 +1172,11 @@ async def _download_single_attempt(
         ydl_opts["external_downloader"] = "aria2c"
         ydl_opts["external_downloader_args"] = {
             "aria2c": [
-                "-x", "16", "-s", "16", "-k", "1M",
+                "-x", "8", "-s", "8", "-k", "1M",
                 "--file-allocation=none",
-                "--max-connection-per-server=16",
-                "--min-split-size=1M", "--split=16",
+                "--max-connection-per-server=8",
+                "--min-split-size=1M", "--split=8",
+                "--retry-wait=1", "--max-tries=0",
                 "--timeout=30",  # aria2c timeout
             ]
         }
@@ -1427,7 +1435,7 @@ async def download_video(youtube_id: str, job_id: str) -> dict:
                 {"job_id": job_id, "youtube_id": youtube_id, "attempt": attempt}
             )
 
-            metadata_result = await extract_audio_url(youtube_id, job_id, proxy_session_id)
+            metadata_result = await extract_video_url(youtube_id, job_id, proxy_session_id)
 
             # Update progress - metadata extracted
             job_progress[job_id]["status"] = "downloading"
@@ -1595,7 +1603,7 @@ async def download_video(youtube_id: str, job_id: str) -> dict:
                 "download",
                 {"job_id": job_id, "youtube_id": youtube_id}
             )
-            metadata_result = await extract_audio_url(youtube_id, job_id, proxy_session_id)
+            metadata_result = await extract_video_url(youtube_id, job_id, proxy_session_id)
 
             job_progress[job_id]["status"] = "downloading"
 
