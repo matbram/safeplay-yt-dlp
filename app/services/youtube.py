@@ -930,11 +930,11 @@ async def _download_single_attempt(
         "buffersize": 1024 * 64,
         "http_chunk_size": 10485760,
         # Prefer English audio track
-        # Use web client to avoid PO token requirements for audio formats
+        # Use rotating player client to find one that works
         "extractor_args": {
             "youtube": {
                 "lang": ["en", "en-US", "en-GB"],
-                "player_client": ["web"],
+                "player_client": player_client,
             }
         },
     }
