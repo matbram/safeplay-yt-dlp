@@ -501,9 +501,11 @@ async def download_tier1_po_token(
         "socket_timeout": 30,
         # NO PROXY - direct download with PO token from bgutil plugin
         # Prefer English audio track
+        # Limit to single client (android) to reduce PO token generation overhead
         "extractor_args": {
             "youtube": {
                 "lang": ["en", "en-US", "en-GB"],
+                "player_client": ["android"],
             }
         },
     }
@@ -730,9 +732,11 @@ async def extract_video_url(
         "geo_bypass": True,
         "socket_timeout": 30,
         # Prefer English audio track
+        # Limit to single client (android) to reduce PO token generation overhead
         "extractor_args": {
             "youtube": {
                 "lang": ["en", "en-US", "en-GB"],
+                "player_client": ["android"],
             }
         },
     }
@@ -1156,9 +1160,11 @@ async def _download_single_attempt(
         "buffersize": 1024 * 64,
         "http_chunk_size": 10485760,
         # Prefer original/English audio track
+        # Limit to single client (android) to reduce PO token generation overhead
         "extractor_args": {
             "youtube": {
                 "lang": ["en", "en-US", "en-GB"],  # Prefer English
+                "player_client": ["android"],
             }
         },
     }
@@ -1277,15 +1283,9 @@ async def download_video(youtube_id: str, job_id: str) -> dict:
         }
     )
 
-    # === EARLY RESTRICTION CHECK ===
-    # Check for age-restricted, private, premium, or live content BEFORE downloading.
-    # This fails fast with a clear error instead of wasting time on doomed downloads.
-    try:
-        job_progress[job_id]["status"] = "checking"
-        await check_video_restrictions(youtube_id, job_id)
-    except PERMANENT_ERRORS:
-        # Re-raise permanent errors - these won't be fixed by retrying
-        raise
+    # === RESTRICTION CHECK SKIPPED FOR SPEED ===
+    # Previously did early restriction check here, but it added 8-10s overhead.
+    # Now we rely on yt-dlp's own error handling for restricted content.
 
     total_start = time.time()
 
