@@ -15,10 +15,8 @@ from app.config import settings
 from app.middleware.auth import verify_api_key
 from app.services.youtube import (
     job_progress, cancel_job, cancel_all_jobs, clear_completed_jobs,
-    COST_TIER1_PO_TOKEN, COST_TIER2_PROXY,
+    COST_PER_DOWNLOAD,
 )
-from app.services.method_cache import get_method_cache
-from app.services.po_token import get_token_manager
 from app.services import logger
 
 
@@ -194,64 +192,30 @@ async def get_system_info(api_key: str = Depends(verify_api_key)):
 @router.get("/api/admin/download-stats")
 async def get_download_stats(api_key: str = Depends(verify_api_key)):
     """
-    Get download method statistics and cost tracking.
+    Get download statistics and cost tracking.
 
     Returns:
-        - Method cache stats (Tier 1 vs Tier 2 success rates)
-        - Estimated costs
-        - PO token status
+        - Active job count
+        - Cost per download
     """
-    method_cache = get_method_cache()
-    token_manager = get_token_manager()
-
-    cache_stats = method_cache.get_stats()
-    token_status = token_manager.get_status()
-
-    # Calculate estimated costs
-    tier1_successes = cache_stats.get("tier1_successes", 0)
-    tier2_successes = cache_stats.get("tier2_successes", 0)
-
-    tier1_cost = tier1_successes * COST_TIER1_PO_TOKEN
-    tier2_cost = tier2_successes * COST_TIER2_PROXY
-    total_cost = tier1_cost + tier2_cost
-
-    # What it would have cost with proxy-only
-    proxy_only_cost = (tier1_successes + tier2_successes) * COST_TIER2_PROXY
-    cost_savings = proxy_only_cost - total_cost
-    savings_percent = (cost_savings / proxy_only_cost * 100) if proxy_only_cost > 0 else 0
+    active_jobs = len([j for j in job_progress.values() if j.get("status") in ("pending", "downloading", "uploading")])
+    completed_jobs = len([j for j in job_progress.values() if j.get("status") == "completed"])
+    failed_jobs = len([j for j in job_progress.values() if j.get("status") == "failed"])
 
     return {
-        "method_cache": cache_stats,
-        "po_token": token_status,
-        "costs": {
-            "tier1_cost_usd": round(tier1_cost, 4),
-            "tier2_cost_usd": round(tier2_cost, 4),
-            "total_cost_usd": round(total_cost, 4),
-            "proxy_only_cost_usd": round(proxy_only_cost, 4),
-            "savings_usd": round(cost_savings, 4),
-            "savings_percent": round(savings_percent, 1),
+        "jobs": {
+            "active": active_jobs,
+            "completed": completed_jobs,
+            "failed": failed_jobs,
+            "total": len(job_progress),
         },
-        "cost_per_method": {
-            "tier1_po_token": COST_TIER1_PO_TOKEN,
-            "tier2_proxy": COST_TIER2_PROXY,
-        }
+        "costs": {
+            "cost_per_download_usd": COST_PER_DOWNLOAD,
+            "estimated_total_usd": round(completed_jobs * COST_PER_DOWNLOAD, 4),
+        },
     }
 
 
-@router.post("/api/admin/method-cache/clear")
-async def clear_method_cache(api_key: str = Depends(verify_api_key)):
-    """Clear the download method cache."""
-    method_cache = get_method_cache()
-    method_cache.clear()
-    return {"status": "cleared"}
-
-
-@router.post("/api/admin/po-token/invalidate")
-async def invalidate_po_token(api_key: str = Depends(verify_api_key)):
-    """Invalidate the cached PO token (forces refresh on next download)."""
-    token_manager = get_token_manager()
-    token_manager.invalidate()
-    return {"status": "invalidated"}
 
 
 # WebSocket connections for real-time updates

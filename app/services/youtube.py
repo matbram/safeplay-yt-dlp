@@ -1,31 +1,21 @@
-"""YouTube video download service with hybrid Tier 1/Tier 2 strategy.
+"""YouTube audio download service with proxy-based extraction.
 
-HYBRID DOWNLOAD STRATEGY
-========================
-This service implements a cost-optimized hybrid download strategy:
+DOWNLOAD STRATEGY
+=================
+This service downloads audio from YouTube using residential proxies:
 
-Tier 1 (Primary - PO Token): ~$0.008/video, ~60% success rate
-    - Uses Proof-of-Origin (PO) tokens via bgutil-ytdlp-pot-provider
-    - PO tokens prove we're a legitimate browser, bypassing IP-binding
-    - Extracts URLs that work from ANY IP (no proxy needed for download)
-    - Downloads 240p MP4 directly via aria2c (8 connections, no proxy)
-    - Best for: Most regular videos
+- Uses Oxylabs residential proxy for extraction AND download
+- Downloads lowest quality audio (targets ~64kbps) for smallest file sizes
+- Uses aria2c for fast multi-connection downloads (8 connections)
+- Supports smart retry with proxy rotation and player client cycling
 
-Tier 2 (Fallback - Full Proxy): ~$0.12/video, ~100% success rate
-    - Uses Oxylabs residential proxy for extraction AND download
-    - Required when Tier 1 fails (age-restricted, region-locked, etc.)
-    - Downloads 240p MP4 via aria2c through proxy (8 connections)
-    - Best for: Age-restricted, region-locked, premium content
-
-SMART CACHING:
-- Tracks which videos need Tier 2 (proxy)
-- Skips Tier 1 for videos known to require proxy
-- Reduces wasted time and API calls
+AUDIO-FIRST APPROACH:
+- Default mode downloads audio-only (smallest files, fastest processing)
+- Video download functionality is preserved but not the default
+- Audio quality targets lowest available bitrate (~64kbps)
 
 EXPECTED COSTS:
-- ~60% of videos use Tier 1: $0.008/video
-- ~40% of videos need Tier 2: $0.12/video
-- Blended average: ~$0.05/video (56% cheaper than always using proxy)
+- ~$0.12/video (proxy bandwidth)
 """
 
 import asyncio
@@ -35,7 +25,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Optional
 from concurrent.futures import ThreadPoolExecutor
 
 import yt_dlp
@@ -48,12 +38,6 @@ from app.services.proxy import (
     get_fresh_session_id,
 )
 from app.services import logger
-from app.services.po_token import get_token_manager
-from app.services.method_cache import (
-    get_method_cache,
-    DownloadMethod,
-    FailureReason,
-)
 from app.utils.exceptions import (
     VideoUnavailableError,
     PrivateVideoError,
@@ -84,7 +68,7 @@ CIRCUIT_BREAKER_DELAY = 10  # Reduced - we've already tried many IPs
 PLAYER_CLIENTS = [
     ["android"],           # Most reliable for non-age-restricted
     ["ios"],               # Good fallback
-    ["web"],               # Works with PO token
+    ["web"],               # Standard web client
     ["mweb"],              # Mobile web - sometimes bypasses checks
     ["android", "ios"],    # Combined - yt-dlp tries both
 ]
@@ -127,27 +111,21 @@ else:
 
 
 # === COST TRACKING ===
-# Estimated costs per download method
-COST_TIER1_PO_TOKEN = 0.008  # ~$0.008 per video (minimal overhead)
-COST_TIER2_PROXY = 0.12  # ~$0.12 per video (full proxy bandwidth)
-
-# Tier 1 configuration
-TIER1_TIMEOUT_SECONDS = 30  # Shorter timeout for Tier 1 (fail fast)
-TIER1_MAX_RETRIES = 2  # Fewer retries for Tier 1 (fallback to Tier 2 quickly)
+COST_PER_DOWNLOAD = 0.12  # ~$0.12 per video (proxy bandwidth)
 
 
 @dataclass
 class DownloadResult:
-    """Result of a video download operation."""
+    """Result of an audio/video download operation."""
     success: bool
     file_path: Optional[str] = None
     title: str = "Unknown"
     duration_seconds: int = 0
     youtube_id: str = ""
-    ext: str = "mp4"
+    ext: str = "m4a"
     filesize_bytes: int = 0
     download_time: float = 0.0
-    method: DownloadMethod = DownloadMethod.UNKNOWN
+    method: str = "proxy"
     cost: float = 0.0
     error: Optional[str] = None
     cancelled: bool = False
@@ -443,265 +421,23 @@ def _classify_error(error_msg: str) -> Exception:
 
 
 # =============================================================================
-# TIER 1: PO TOKEN DOWNLOAD (NO PROXY)
+# PHASE 1: METADATA & URL EXTRACTION (WITH PROXY)
 # =============================================================================
 
-async def download_tier1_po_token(
-    youtube_id: str,
-    job_id: str,
-) -> DownloadResult:
-    """
-    TIER 1: Download video using PO token (no proxy needed).
-
-    Uses the bgutil-ytdlp-pot-provider plugin which automatically generates
-    PO tokens via the bgutil HTTP server. This bypasses YouTube's IP-binding,
-    allowing direct downloads without residential proxies.
-
-    Requires: bgutil server running at http://127.0.0.1:4416
-    Setup: sudo bash deployment/setup-bgutil.sh
-
-    Cost: ~$0.008 per video
-    Expected success rate: ~60%
-
-    Args:
-        youtube_id: YouTube video ID
-        job_id: Job tracking ID
-
-    Returns:
-        DownloadResult with success status and file info
-    """
-    url = f"https://www.youtube.com/watch?v={youtube_id}"
-    method_cache = get_method_cache()
-
-    logger.info(
-        f"[TIER 1] Starting PO token download for {youtube_id}",
-        "download",
-        {"job_id": job_id, "youtube_id": youtube_id, "method": "tier1_po_token"}
-    )
-
-    # Check if bgutil server is available (PO token generation)
-    token_manager = get_token_manager()
-    if not token_manager.is_available():
-        logger.warn(
-            f"[TIER 1] bgutil server not available, skipping Tier 1. "
-            f"Run: sudo bash deployment/setup-bgutil.sh",
-            "download",
-            {"job_id": job_id, "youtube_id": youtube_id}
-        )
-        return DownloadResult(
-            success=False,
-            youtube_id=youtube_id,
-            method=DownloadMethod.TIER1_PO_TOKEN,
-            error="bgutil PO token server not available"
-        )
-
-    method_cache.record_attempt(DownloadMethod.TIER1_PO_TOKEN)
-    start_time = time.time()
-
-    # Create temp directory for download
-    temp_dir = Path(settings.TEMP_DIR) / job_id
-    temp_dir.mkdir(parents=True, exist_ok=True)
-
-    # Create custom logger for yt-dlp
-    ytdlp_logger = logger.YtdlpLogger(job_id)
-
-    # yt-dlp options WITHOUT proxy - the bgutil plugin handles PO tokens automatically
-    ydl_opts = {
-        "quiet": False,
-        "verbose": True,
-        "logger": ytdlp_logger,
-        "outtmpl": str(temp_dir / "%(id)s.%(ext)s"),
-        # 240p video - small files, fast downloads, sufficient for processing
-        "format": "best[protocol=https][ext=mp4]/best[protocol=https]/best",
-        "format_sort": ["res:240", "br"],
-        "geo_bypass": True,
-        "socket_timeout": 30,
-        # NO PROXY - direct download with PO token from bgutil plugin
-        # Prefer English audio track
-        # Limit to single client (android) to reduce PO token generation overhead
-        "extractor_args": {
-            "youtube": {
-                "lang": ["en", "en-US", "en-GB"],
-                "player_client": ["android"],
-            }
-        },
-    }
-
-    # Enable aria2c for multi-connection download if available
-    if ARIA2C_AVAILABLE:
-        ydl_opts["external_downloader"] = "aria2c"
-        ydl_opts["external_downloader_args"] = {
-            "aria2c": [
-                "-x", "8", "-s", "8", "-k", "1M",
-                "--file-allocation=none",
-                "--max-connection-per-server=8",
-                "--min-split-size=1M", "--split=8",
-                "--retry-wait=1", "--max-tries=0",
-                "--timeout=30",
-            ]
-        }
-
-    # Enable Node.js for YouTube bot challenge solving
-    if NODEJS_AVAILABLE:
-        ydl_opts["js_runtimes"] = {"node": {}}
-
-    def _blocking_download():
-        """Run blocking yt-dlp download."""
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            ext = info.get("ext", "mp4")
-            output_file = temp_dir / f"{youtube_id}.{ext}"
-            filesize = output_file.stat().st_size if output_file.exists() else 0
-
-            return {
-                "info": info,
-                "ext": ext,
-                "output_file": output_file,
-                "filesize": filesize,
-                "duration": time.time() - start_time,
-            }
-
-    try:
-        # Run with timeout
-        loop = asyncio.get_event_loop()
-        download_task = loop.run_in_executor(_download_executor, _blocking_download)
-        download_result = await asyncio.wait_for(download_task, timeout=TIER1_TIMEOUT_SECONDS + DOWNLOAD_TIMEOUT_SECONDS)
-
-        info = download_result["info"]
-        download_time = download_result["duration"]
-
-        # Success!
-        method_cache.record_success(youtube_id, DownloadMethod.TIER1_PO_TOKEN)
-
-        logger.success(
-            f"[TIER 1] Download complete: {info.get('title', 'Unknown')[:50]}",
-            "download",
-            {
-                "job_id": job_id,
-                "youtube_id": youtube_id,
-                "method": "tier1_po_token",
-                "title": info.get("title", "Unknown")[:50],
-                "filesize_mb": round(download_result["filesize"] / (1024 * 1024), 2),
-                "download_time_seconds": round(download_time, 2),
-                "cost": COST_TIER1_PO_TOKEN,
-            }
-        )
-
-        return DownloadResult(
-            success=True,
-            file_path=str(download_result["output_file"]),
-            title=info.get("title", "Unknown"),
-            duration_seconds=info.get("duration", 0),
-            youtube_id=youtube_id,
-            ext=download_result["ext"],
-            filesize_bytes=download_result["filesize"],
-            download_time=download_time,
-            method=DownloadMethod.TIER1_PO_TOKEN,
-            cost=COST_TIER1_PO_TOKEN,
-        )
-
-    except asyncio.TimeoutError:
-        duration = time.time() - start_time
-        error_msg = f"Tier 1 download timed out after {duration:.1f}s"
-        logger.warn(f"[TIER 1] {error_msg}", "download", {
-            "job_id": job_id, "youtube_id": youtube_id
-        })
-        method_cache.record_failure(youtube_id, DownloadMethod.TIER1_PO_TOKEN, FailureReason.UNKNOWN)
-        return DownloadResult(
-            success=False,
-            youtube_id=youtube_id,
-            method=DownloadMethod.TIER1_PO_TOKEN,
-            error=error_msg
-        )
-
-    except yt_dlp.utils.DownloadError as e:
-        error_msg = str(e)
-        duration = time.time() - start_time
-
-        # Classify the failure reason
-        failure_reason = _classify_tier1_failure(error_msg)
-
-        logger.warn(
-            f"[TIER 1] Download failed ({failure_reason.value}): {error_msg[:100]}",
-            "download",
-            {"job_id": job_id, "youtube_id": youtube_id, "failure_reason": failure_reason.value}
-        )
-
-        method_cache.record_failure(youtube_id, DownloadMethod.TIER1_PO_TOKEN, failure_reason)
-
-        # Check if this is a permanent error that won't be fixed by Tier 2
-        classified = _classify_error(error_msg)
-        if isinstance(classified, PERMANENT_ERRORS):
-            raise classified
-
-        return DownloadResult(
-            success=False,
-            youtube_id=youtube_id,
-            method=DownloadMethod.TIER1_PO_TOKEN,
-            error=error_msg
-        )
-
-    except Exception as e:
-        error_msg = str(e)
-        duration = time.time() - start_time
-        logger.warn(
-            f"[TIER 1] Unexpected error: {error_msg[:100]}",
-            "download",
-            {"job_id": job_id, "youtube_id": youtube_id}
-        )
-        method_cache.record_failure(youtube_id, DownloadMethod.TIER1_PO_TOKEN, FailureReason.UNKNOWN)
-        return DownloadResult(
-            success=False,
-            youtube_id=youtube_id,
-            method=DownloadMethod.TIER1_PO_TOKEN,
-            error=error_msg
-        )
-
-
-def _classify_tier1_failure(error_msg: str) -> FailureReason:
-    """Classify why Tier 1 failed for caching purposes."""
-    error_lower = error_msg.lower()
-
-    if "403" in error_msg or "forbidden" in error_lower:
-        return FailureReason.IP_BINDING
-    elif "age" in error_lower and "restrict" in error_lower:
-        return FailureReason.AGE_RESTRICTED
-    elif "not available" in error_lower and ("country" in error_lower or "region" in error_lower):
-        return FailureReason.REGION_LOCKED
-    elif "sign in" in error_lower or "bot" in error_lower or "confirm" in error_lower:
-        return FailureReason.BOT_DETECTION
-    elif "token" in error_lower and ("expired" in error_lower or "invalid" in error_lower):
-        return FailureReason.TOKEN_EXPIRED
-    elif "format" in error_lower and "not available" in error_lower:
-        return FailureReason.FORMAT_UNAVAILABLE
-    else:
-        return FailureReason.UNKNOWN
-
-
-# =============================================================================
-# TIER 2: PROXY DOWNLOAD (PHASE 1 + PHASE 2)
-# =============================================================================
-# The existing extract_video_url and download_from_cdn functions form Tier 2.
-# They use the Oxylabs residential proxy for both extraction and download.
-
-# =============================================================================
-# TIER 2 - PHASE 1: METADATA EXTRACTION (WITH PROXY)
-# =============================================================================
-
-async def extract_video_url(
+async def extract_audio_url(
     youtube_id: str,
     job_id: str,
     proxy_session_id: str,
 ) -> dict:
     """
-    PHASE 1: Extract video metadata and signed CDN URL using proxy.
+    PHASE 1: Extract audio metadata and signed CDN URL using proxy.
 
     This function uses yt-dlp with the Oxylabs proxy to:
     1. Fetch video metadata (title, duration, etc.)
-    2. Extract the direct download URL for the best 240p MP4 format
+    2. Extract the direct download URL for the lowest bitrate audio format
     3. Return all info WITHOUT downloading the actual file
 
-    Bandwidth usage: ~700KB-1MB per video (metadata only)
+    Bandwidth usage: ~500KB-1MB per video (metadata only)
 
     Args:
         youtube_id: YouTube video ID
@@ -713,7 +449,7 @@ async def extract_video_url(
             - title: Video title
             - duration_seconds: Video duration
             - cdn_url: Signed URL for direct download (googlevideo.com)
-            - ext: File extension (mp4)
+            - ext: File extension (m4a, webm, etc.)
             - filesize_approx: Approximate file size in bytes
 
     Raises:
@@ -743,17 +479,18 @@ async def extract_video_url(
         "logger": ytdlp_logger,
         "skip_download": True,  # CRITICAL: Don't download, just extract info
         "extract_flat": False,  # We need full format info with URLs
-        # 240p video - small files, fast downloads, sufficient for processing
-        "format": "best[protocol=https][ext=mp4]/best[protocol=https]/best",
-        "format_sort": ["res:240", "br"],
+        # Audio-only - lowest bitrate for smallest files
+        # IMPORTANT: Do NOT include 'best' fallback as it includes video
+        "format": "worstaudio[protocol=https]/worstaudio",
+        "format_sort": ["abr"],
         "geo_bypass": True,
         "socket_timeout": 30,
         # Prefer English audio track
-        # Limit to single client (android) to reduce PO token generation overhead
+        # Use web client to avoid PO token requirements for audio formats
         "extractor_args": {
             "youtube": {
                 "lang": ["en", "en-US", "en-GB"],
-                "player_client": ["android"],
+                "player_client": ["web"],
             }
         },
     }
@@ -793,32 +530,32 @@ async def extract_video_url(
 
         # If not directly available, look in requested_formats
         if not cdn_url and info.get("requested_formats"):
-            # Get the video format (prefer one with both video and audio)
+            # Get the audio format
             for fmt in info["requested_formats"]:
                 if fmt.get("url"):
                     cdn_url = fmt.get("url")
                     break
 
-        # Fallback: look in formats list for video
+        # Fallback: look in formats list for audio-only formats
         if not cdn_url and info.get("formats"):
-            # Find low quality video formats (prefer mp4 with both video and audio)
-            video_formats = [
+            # Find audio-only formats (no video codec)
+            audio_formats = [
                 f for f in info["formats"]
-                if f.get("vcodec") != "none" and f.get("ext") == "mp4"
+                if f.get("vcodec") == "none" and f.get("acodec") != "none"
             ]
-            if video_formats:
-                # Sort by resolution (height) to get lowest quality
-                video_formats.sort(key=lambda f: f.get("height") or f.get("filesize") or 0)
-                cdn_url = video_formats[0].get("url")
+            if audio_formats:
+                # Sort by bitrate (abr) ascending to get lowest quality audio
+                audio_formats.sort(key=lambda f: f.get("abr") or f.get("filesize") or 0)
+                cdn_url = audio_formats[0].get("url")
 
         if not cdn_url:
             raise DownloadError(
                 f"Could not extract CDN URL for {youtube_id}. "
-                "No video format URLs found in metadata."
+                "No audio format URLs found in metadata."
             )
 
         # Get file extension and size
-        ext = info.get("ext", "mp4")
+        ext = info.get("ext", "m4a")
         filesize_approx = info.get("filesize") or info.get("filesize_approx") or 0
 
         logger.success(
@@ -1177,9 +914,10 @@ async def _download_single_attempt(
         "socket_timeout": proxy_config.get("socket_timeout", 30),
         "retries": proxy_config.get("retries", 2),
         "outtmpl": str(temp_dir / f"{youtube_id}.%(ext)s"),
-        # 240p video - small files, fast downloads, sufficient for processing
-        "format": "best[protocol=https][ext=mp4]/best[protocol=https]/best",
-        "format_sort": ["res:240", "br"],
+        # Audio-only - lowest bitrate for smallest files
+        # IMPORTANT: Do NOT include 'best' fallback as it includes video
+        "format": "worstaudio[protocol=https]/worstaudio",
+        "format_sort": ["abr"],
         "progress_hooks": [lambda d: _progress_hook(d, job_id)],
         "verbose": True,
         "logger": ytdlp_logger,
@@ -1191,12 +929,12 @@ async def _download_single_attempt(
         "concurrent_fragment_downloads": 8,
         "buffersize": 1024 * 64,
         "http_chunk_size": 10485760,
-        # Prefer original/English audio track
-        # Use specified player client(s)
+        # Prefer English audio track
+        # Use web client to avoid PO token requirements for audio formats
         "extractor_args": {
             "youtube": {
-                "lang": ["en", "en-US", "en-GB"],  # Prefer English
-                "player_client": player_client,
+                "lang": ["en", "en-US", "en-GB"],
+                "player_client": ["web"],
             }
         },
     }
@@ -1227,7 +965,7 @@ async def _download_single_attempt(
         """Run blocking yt-dlp download."""
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
-            ext = info.get("ext", "mp4")
+            ext = info.get("ext", "m4a")
             output_file = temp_dir / f"{youtube_id}.{ext}"
             filesize = output_file.stat().st_size if output_file.exists() else 0
 
@@ -1404,7 +1142,7 @@ async def download_video(youtube_id: str, job_id: str) -> dict:
                 "filesize_bytes": download_result["filesize_bytes"],
                 "download_time": download_result["download_time"],
                 "method": "proxy_smart_rotation",
-                "cost": COST_TIER2_PROXY,
+                "cost": COST_PER_DOWNLOAD,
                 "attempts": attempt,
             }
 
@@ -1585,7 +1323,7 @@ async def download_video(youtube_id: str, job_id: str) -> dict:
                 "filesize_bytes": download_result["filesize_bytes"],
                 "download_time": download_result["download_time"],
                 "method": "proxy_circuit_breaker",
-                "cost": COST_TIER2_PROXY,
+                "cost": COST_PER_DOWNLOAD,
                 "attempts": MAX_RETRY_ATTEMPTS + 1,
             }
 
@@ -1632,7 +1370,7 @@ async def download_video(youtube_id: str, job_id: str) -> dict:
         "bad_proxy_rotations": bad_proxy_count,
         "total_time": total_duration,
         "method": "all_failed",
-        "cost": COST_TIER2_PROXY,
+        "cost": COST_PER_DOWNLOAD,
     }
 
 
