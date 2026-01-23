@@ -13,13 +13,20 @@ import time
 import os
 import re
 import json
+import uuid
 from pathlib import Path
 from datetime import datetime
 from typing import Optional
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
 
+from app.services.proxy import get_proxy_config
+from app.config import settings
+
 router = APIRouter(prefix="/benchmark", tags=["benchmark"])
+
+# Check if proxy is configured
+PROXY_AVAILABLE = bool(settings.OXYLABS_USERNAME and settings.OXYLABS_PASSWORD)
 
 # Quality presets
 QUALITY_PRESETS = {
@@ -147,12 +154,21 @@ async def benchmark_websocket(websocket: WebSocket):
                 video_id = data.get("video_id", "").strip()
                 format_string = data.get("format", "worstaudio")
                 preset_name = data.get("preset_name", "Custom")
+                use_proxy = data.get("use_proxy", False)
 
                 # Validate video ID
                 if not video_id:
                     await websocket.send_json({
                         "type": "error",
                         "message": "Video ID is required"
+                    })
+                    continue
+
+                # Check proxy availability if requested
+                if use_proxy and not PROXY_AVAILABLE:
+                    await websocket.send_json({
+                        "type": "error",
+                        "message": "Proxy not configured (OXYLABS credentials missing)"
                     })
                     continue
 
@@ -164,7 +180,7 @@ async def benchmark_websocket(websocket: WebSocket):
                         video_id = video_id.split("youtu.be/")[1].split("?")[0]
 
                 # Run benchmark
-                await run_benchmark(websocket, video_id, format_string, preset_name)
+                await run_benchmark(websocket, video_id, format_string, preset_name, use_proxy)
 
             elif data.get("action") == "list_formats":
                 video_id = data.get("video_id", "").strip()
@@ -175,17 +191,25 @@ async def benchmark_websocket(websocket: WebSocket):
         pass
 
 
-async def run_benchmark(websocket: WebSocket, video_id: str, format_string: str, preset_name: str):
+async def run_benchmark(websocket: WebSocket, video_id: str, format_string: str, preset_name: str, use_proxy: bool = False):
     """Run a benchmark and stream results via WebSocket"""
 
     temp_dir = tempfile.mkdtemp(prefix="yt_benchmark_")
     output_template = os.path.join(temp_dir, "%(id)s.%(ext)s")
+
+    # Get proxy URL if enabled
+    proxy_url = None
+    if use_proxy and PROXY_AVAILABLE:
+        session_id = f"bench_{uuid.uuid4().hex[:12]}"
+        proxy_config = get_proxy_config(session_id)
+        proxy_url = proxy_config.get("proxy")
 
     await websocket.send_json({
         "type": "start",
         "video_id": video_id,
         "format": format_string,
         "preset_name": preset_name,
+        "use_proxy": use_proxy,
         "timestamp": datetime.now().isoformat(),
     })
 
@@ -198,8 +222,18 @@ async def run_benchmark(websocket: WebSocket, video_id: str, format_string: str,
         "-o", output_template,
         "--no-playlist",
         "--print-to-file", "%(title)s", os.path.join(temp_dir, "title.txt"),
-        f"https://www.youtube.com/watch?v={video_id}",
     ]
+
+    # Add proxy if enabled
+    if proxy_url:
+        cmd.extend(["--proxy", proxy_url])
+        await websocket.send_json({
+            "type": "log",
+            "level": "info",
+            "message": f"Using OxyLabs proxy (US residential)",
+        })
+
+    cmd.append(f"https://www.youtube.com/watch?v={video_id}")
 
     start_time = time.time()
     speed_samples = []
@@ -304,6 +338,7 @@ async def run_benchmark(websocket: WebSocket, video_id: str, format_string: str,
                 "title": title,
                 "preset_name": preset_name,
                 "format": format_string,
+                "use_proxy": use_proxy,
                 "file_size": file_size,
                 "file_size_formatted": format_size(file_size),
                 "duration": round(duration, 2),
@@ -820,6 +855,99 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
         .analysis-card.fastest .value { color: var(--success); }
         .analysis-card.slowest .value { color: var(--error); }
         .analysis-card.ratio .value { color: var(--warning); }
+
+        .toggle-group {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 12px;
+            background: var(--bg-tertiary);
+            border-radius: 8px;
+            margin-bottom: 16px;
+        }
+
+        .toggle-label {
+            display: flex;
+            flex-direction: column;
+        }
+
+        .toggle-label .title {
+            font-weight: 500;
+            font-size: 0.9rem;
+        }
+
+        .toggle-label .subtitle {
+            font-size: 0.75rem;
+            color: var(--text-secondary);
+        }
+
+        .toggle-switch {
+            position: relative;
+            width: 50px;
+            height: 26px;
+        }
+
+        .toggle-switch input {
+            opacity: 0;
+            width: 0;
+            height: 0;
+        }
+
+        .toggle-slider {
+            position: absolute;
+            cursor: pointer;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background-color: var(--border);
+            transition: 0.3s;
+            border-radius: 26px;
+        }
+
+        .toggle-slider:before {
+            position: absolute;
+            content: "";
+            height: 20px;
+            width: 20px;
+            left: 3px;
+            bottom: 3px;
+            background-color: white;
+            transition: 0.3s;
+            border-radius: 50%;
+        }
+
+        .toggle-switch input:checked + .toggle-slider {
+            background-color: var(--accent);
+        }
+
+        .toggle-switch input:checked + .toggle-slider:before {
+            transform: translateX(24px);
+        }
+
+        .toggle-switch input:disabled + .toggle-slider {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+
+        .proxy-badge {
+            display: inline-block;
+            padding: 2px 6px;
+            border-radius: 4px;
+            font-size: 0.7rem;
+            font-weight: 600;
+            margin-left: 6px;
+        }
+
+        .proxy-badge.proxy-on {
+            background: rgba(139, 92, 246, 0.2);
+            color: #a78bfa;
+        }
+
+        .proxy-badge.proxy-off {
+            background: rgba(100, 100, 100, 0.2);
+            color: #888;
+        }
     </style>
 </head>
 <body>
@@ -898,6 +1026,17 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
                         <input type="text" id="customFormat" placeholder="e.g., bestaudio[ext=m4a]">
                     </div>
 
+                    <div class="toggle-group">
+                        <div class="toggle-label">
+                            <span class="title">Use OxyLabs Proxy</span>
+                            <span class="subtitle">Route through US residential proxy</span>
+                        </div>
+                        <label class="toggle-switch">
+                            <input type="checkbox" id="useProxy">
+                            <span class="toggle-slider"></span>
+                        </label>
+                    </div>
+
                     <button class="btn" id="runBtn">
                         <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                             <polygon points="5 3 19 12 5 21 5 3"></polygon>
@@ -946,6 +1085,7 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
                         <thead>
                             <tr>
                                 <th>Quality</th>
+                                <th>Proxy</th>
                                 <th>Video</th>
                                 <th>Size</th>
                                 <th>Time</th>
@@ -1057,6 +1197,7 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
                         addResult({
                             success: false,
                             preset_name: selectedPresetName,
+                            use_proxy: document.getElementById('useProxy').checked,
                             error: data.error
                         });
                     }
@@ -1132,8 +1273,12 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
 
             tbody.innerHTML = results.map((r, i) => {
                 if (!r.success) {
+                    const proxyBadge = r.use_proxy
+                        ? '<span class="proxy-badge proxy-on">PROXY</span>'
+                        : '<span class="proxy-badge proxy-off">DIRECT</span>';
                     return `<tr>
                         <td>${r.preset_name || 'Unknown'}</td>
+                        <td>${proxyBadge}</td>
                         <td colspan="4">--</td>
                         <td class="status-error">Failed</td>
                     </tr>`;
@@ -1141,9 +1286,13 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
 
                 const speedClass = r.avg_speed_mbps > 10 ? 'speed-fast' :
                                    r.avg_speed_mbps > 3 ? 'speed-medium' : 'speed-slow';
+                const proxyBadge = r.use_proxy
+                    ? '<span class="proxy-badge proxy-on">PROXY</span>'
+                    : '<span class="proxy-badge proxy-off">DIRECT</span>';
 
                 return `<tr>
                     <td><strong>${r.preset_name}</strong></td>
+                    <td>${proxyBadge}</td>
                     <td title="${r.title}">${(r.title || r.video_id).substring(0, 30)}${(r.title || '').length > 30 ? '...' : ''}</td>
                     <td>${r.file_size_formatted}</td>
                     <td>${r.duration}s</td>
@@ -1168,10 +1317,13 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
             const slowest = successful.reduce((a, b) => a.avg_speed_mbps < b.avg_speed_mbps ? a : b);
             const ratio = (fastest.avg_speed_mbps / slowest.avg_speed_mbps).toFixed(2);
 
+            const fastestProxy = fastest.use_proxy ? ' (Proxy)' : ' (Direct)';
+            const slowestProxy = slowest.use_proxy ? ' (Proxy)' : ' (Direct)';
+
             document.getElementById('fastestSpeed').textContent = fastest.avg_speed_mbps + ' Mbps';
-            document.getElementById('fastestLabel').textContent = fastest.preset_name;
+            document.getElementById('fastestLabel').textContent = fastest.preset_name + fastestProxy;
             document.getElementById('slowestSpeed').textContent = slowest.avg_speed_mbps + ' Mbps';
-            document.getElementById('slowestLabel').textContent = slowest.preset_name;
+            document.getElementById('slowestLabel').textContent = slowest.preset_name + slowestProxy;
             document.getElementById('speedRatio').textContent = ratio + 'x';
         }
 
@@ -1192,6 +1344,7 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
             const customFormat = document.getElementById('customFormat').value.trim();
             const format = customFormat || selectedFormat;
             const presetName = customFormat ? 'Custom' : selectedPresetName;
+            const useProxy = document.getElementById('useProxy').checked;
 
             isRunning = true;
             document.getElementById('runBtn').disabled = true;
@@ -1200,7 +1353,8 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
                 action: 'run_benchmark',
                 video_id: videoId,
                 format: format,
-                preset_name: presetName
+                preset_name: presetName,
+                use_proxy: useProxy
             }));
         });
 
