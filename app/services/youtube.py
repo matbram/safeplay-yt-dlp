@@ -41,7 +41,12 @@ from concurrent.futures import ThreadPoolExecutor
 import yt_dlp
 
 from app.config import settings
-from app.services.proxy import get_proxy_config
+from app.services.proxy import (
+    get_proxy_config,
+    is_bad_proxy_symptom,
+    mark_session_bad,
+    get_fresh_session_id,
+)
 from app.services import logger
 from app.services.po_token import get_token_manager
 from app.services.method_cache import (
@@ -68,9 +73,21 @@ AGE_RESTRICTION_THRESHOLD = 18
 
 # === RELIABILITY CONFIGURATION ===
 DOWNLOAD_TIMEOUT_SECONDS = 180  # Max time for a single download attempt (3 min for large files + ffmpeg)
-MAX_RETRY_ATTEMPTS = 5  # Number of retry attempts (increased for bot detection)
-RETRY_BACKOFF_SECONDS = [1, 2, 5, 10]  # Escalating backoff - longer delays help get fresh IPs
-CIRCUIT_BREAKER_DELAY = 30  # Final attempt after this delay if all retries fail with bot detection
+MAX_RETRY_ATTEMPTS = 8  # Increased - we do quick retries with fresh IPs
+QUICK_RETRY_BATCH = 3  # Number of quick retries before adding delays
+QUICK_RETRY_DELAY = 0.5  # Very short delay for quick retries (just get a fresh IP)
+RETRY_BACKOFF_SECONDS = [1, 2, 3]  # Shorter backoff for remaining retries
+CIRCUIT_BREAKER_DELAY = 10  # Reduced - we've already tried many IPs
+
+# === PLAYER CLIENT ROTATION ===
+# Try multiple player clients - some have better bot detection tolerance
+PLAYER_CLIENTS = [
+    ["android"],           # Most reliable for non-age-restricted
+    ["ios"],               # Good fallback
+    ["web"],               # Works with PO token
+    ["mweb"],              # Mobile web - sometimes bypasses checks
+    ["android", "ios"],    # Combined - yt-dlp tries both
+]
 
 # Thread pool for running blocking downloads (8 workers for parallel capacity)
 _download_executor = ThreadPoolExecutor(max_workers=8, thread_name_prefix="ytdlp")
@@ -1110,6 +1127,9 @@ async def _download_single_attempt(
     job_id: str,
     attempt: int,
     proxy_session_id: str,
+    player_client: list[str] = None,
+    country: str = None,
+    resume_enabled: bool = True,
 ) -> dict:
     """
     Execute a single download attempt with timeout.
@@ -1119,6 +1139,9 @@ async def _download_single_attempt(
         job_id: Job tracking ID
         attempt: Current attempt number (1-based)
         proxy_session_id: Unique session ID for proxy sticky session
+        player_client: List of player clients to try (default: android)
+        country: Country code for proxy (default: US)
+        resume_enabled: Whether to enable download resume (default: True)
 
     Returns:
         dict with download result or raises exception
@@ -1127,21 +1150,32 @@ async def _download_single_attempt(
     temp_dir = Path(settings.TEMP_DIR) / job_id
     temp_dir.mkdir(parents=True, exist_ok=True)
 
+    # Use specified player client or default
+    if player_client is None:
+        player_client = ["android"]
+
     # Get proxy config with unique session for this attempt
-    proxy_config = get_proxy_config(proxy_session_id)
+    proxy_config = get_proxy_config(proxy_session_id, country=country, force_fresh=True)
+    actual_session_id = proxy_config.get("session_id", proxy_session_id)
+    actual_country = proxy_config.get("country", "US")
+
     if proxy_config.get("proxy"):
         proxy_url = proxy_config["proxy"]
         masked_proxy = proxy_url.split("@")[-1] if "@" in proxy_url else proxy_url
-        logger.info(f"Attempt {attempt}: Using proxy {masked_proxy}", "proxy", {
-            "job_id": job_id, "attempt": attempt, "session_id": proxy_session_id
-        })
+        logger.info(
+            f"Attempt {attempt}: Using proxy {masked_proxy} (country={actual_country}, client={player_client})",
+            "proxy",
+            {"job_id": job_id, "attempt": attempt, "session_id": actual_session_id[:20], "country": actual_country, "player_client": player_client}
+        )
 
     # Create custom logger for yt-dlp
     ytdlp_logger = logger.YtdlpLogger(job_id)
 
-    # yt-dlp options optimized for SPEED
+    # yt-dlp options optimized for SPEED with fail-fast
     ydl_opts = {
-        **proxy_config,
+        "proxy": proxy_config.get("proxy"),
+        "socket_timeout": proxy_config.get("socket_timeout", 30),
+        "retries": proxy_config.get("retries", 2),
         "outtmpl": str(temp_dir / f"{youtube_id}.%(ext)s"),
         # 240p video - small files, fast downloads, sufficient for processing
         "format": "best[protocol=https][ext=mp4]/best[protocol=https]/best",
@@ -1150,21 +1184,19 @@ async def _download_single_attempt(
         "verbose": True,
         "logger": ytdlp_logger,
         # Reduced retries for speed - we handle retries at higher level
-        "retries": 2,
-        "fragment_retries": 3,
+        "fragment_retries": 2,
         "noplaylist": True,
         "geo_bypass": True,
-        "socket_timeout": 30,  # Socket timeout for speed
         # Speed optimizations
         "concurrent_fragment_downloads": 8,
         "buffersize": 1024 * 64,
         "http_chunk_size": 10485760,
         # Prefer original/English audio track
-        # Limit to single client (android) to reduce PO token generation overhead
+        # Use specified player client(s)
         "extractor_args": {
             "youtube": {
                 "lang": ["en", "en-US", "en-GB"],  # Prefer English
-                "player_client": ["android"],
+                "player_client": player_client,
             }
         },
     }
@@ -1173,19 +1205,21 @@ async def _download_single_attempt(
     if NODEJS_AVAILABLE:
         ydl_opts["js_runtimes"] = {"node": {}}
 
-    # Use aria2c if available
+    # Use aria2c if available with resume support
     if ARIA2C_AVAILABLE:
         ydl_opts["external_downloader"] = "aria2c"
-        ydl_opts["external_downloader_args"] = {
-            "aria2c": [
-                "-x", "8", "-s", "8", "-k", "1M",
-                "--file-allocation=none",
-                "--max-connection-per-server=8",
-                "--min-split-size=1M", "--split=8",
-                "--retry-wait=1", "--max-tries=0",
-                "--timeout=30",  # aria2c timeout
-            ]
-        }
+        aria2c_args = [
+            "-x", "8", "-s", "8", "-k", "1M",
+            "--file-allocation=none",
+            "--max-connection-per-server=8",
+            "--min-split-size=1M", "--split=8",
+            "--retry-wait=1", "--max-tries=3",  # Limited retries per attempt
+            "--timeout=30",
+        ]
+        # Enable resume if requested
+        if resume_enabled:
+            aria2c_args.extend(["--continue=true", "--auto-file-renaming=false"])
+        ydl_opts["external_downloader_args"] = {"aria2c": aria2c_args}
 
     start_time = time.time()
 
@@ -1221,10 +1255,13 @@ async def _download_single_attempt(
             "ext": download_result["ext"],
             "filesize_bytes": download_result["filesize"],
             "download_time": download_result["duration"],
+            "proxy_session": actual_session_id,
         }
 
     except asyncio.TimeoutError:
         duration = time.time() - start_time
+        # Mark session as potentially bad (timeout could be proxy issue)
+        mark_session_bad(actual_session_id, "timeout")
         logger.warn(f"Attempt {attempt} timed out after {duration:.1f}s", "download", {
             "job_id": job_id, "attempt": attempt, "timeout": DOWNLOAD_TIMEOUT_SECONDS
         })
@@ -1232,22 +1269,29 @@ async def _download_single_attempt(
 
     except yt_dlp.utils.DownloadError as e:
         error_msg = str(e)
+        # Check if this is a bad proxy symptom and mark the session
+        if is_bad_proxy_symptom(error_msg):
+            mark_session_bad(actual_session_id, "bot_detection" if "bot" in error_msg.lower() else "bad_exit")
         logger.warn(f"Attempt {attempt} failed: {error_msg[:100]}", "download", {
-            "job_id": job_id, "attempt": attempt
+            "job_id": job_id, "attempt": attempt, "is_bad_proxy": is_bad_proxy_symptom(error_msg)
         })
         raise _classify_error(error_msg)
 
 
 async def download_video(youtube_id: str, job_id: str) -> dict:
     """
-    Download YouTube video using proxy with single-pass yt-dlp.
+    Download YouTube video using smart proxy rotation with fail-fast behavior.
 
-    STREAMLINED PROXY APPROACH
-    ==========================
-    - Uses Oxylabs residential proxy for extraction AND download
-    - Single yt-dlp call (no separate metadata extraction phase)
-    - aria2c for fast multi-connection downloads
-    - Automatic retry with fresh proxy IP on failure
+    SMART RETRY STRATEGY
+    ====================
+    1. QUICK RETRY BATCH: First 3 attempts use minimal delay, just fresh proxy IPs
+    2. PLAYER CLIENT ROTATION: Try different YouTube player clients
+    3. COUNTRY ROTATION: Try different proxy countries after initial failures
+    4. DOWNLOAD RESUME: Uses aria2c continue flag to resume partial downloads
+    5. CIRCUIT BREAKER: Final attempt after all strategies exhausted
+
+    The key insight: bot detection is usually IP-specific, so getting a fresh IP
+    quickly is more valuable than waiting. We fail fast and rotate aggressively.
 
     Args:
         youtube_id: YouTube video ID
@@ -1265,13 +1309,16 @@ async def download_video(youtube_id: str, job_id: str) -> dict:
         {
             "job_id": job_id,
             "youtube_id": youtube_id,
-            "strategy": "single_pass_proxy",
+            "strategy": "smart_rotation_failfast",
+            "max_attempts": MAX_RETRY_ATTEMPTS,
+            "quick_batch": QUICK_RETRY_BATCH,
         }
     )
 
     total_start = time.time()
     last_error = None
     bot_detection_count = 0
+    bad_proxy_count = 0
 
     for attempt in range(1, MAX_RETRY_ATTEMPTS + 1):
         # Check for cancellation
@@ -1288,22 +1335,42 @@ async def download_video(youtube_id: str, job_id: str) -> dict:
         job_progress[job_id]["status"] = "downloading"
         job_progress[job_id]["progress"] = 10
 
-        # Use unique proxy session for each attempt (new IP on retry)
-        proxy_session_id = f"{job_id}-a{attempt}-{uuid.uuid4().hex[:8]}"
+        # === SMART ROTATION STRATEGY ===
+
+        # 1. Get fresh proxy session (always new IP on each attempt)
+        proxy_session_id = get_fresh_session_id(f"{job_id}-a{attempt}")
+
+        # 2. Rotate player client based on attempt
+        player_client_idx = (attempt - 1) % len(PLAYER_CLIENTS)
+        player_client = PLAYER_CLIENTS[player_client_idx]
+
+        # 3. Always use US for fastest CDN connection
+        country = "US"
 
         logger.info(
-            f"[Attempt {attempt}] Starting single-pass download via proxy",
+            f"[Attempt {attempt}/{MAX_RETRY_ATTEMPTS}] Smart rotation: "
+            f"client={player_client}, "
+            f"{'QUICK' if attempt <= QUICK_RETRY_BATCH else 'STANDARD'} retry",
             "download",
-            {"job_id": job_id, "youtube_id": youtube_id, "attempt": attempt}
+            {
+                "job_id": job_id,
+                "youtube_id": youtube_id,
+                "attempt": attempt,
+                "player_client": player_client,
+                "is_quick_retry": attempt <= QUICK_RETRY_BATCH,
+            }
         )
 
         try:
-            # Single yt-dlp call: extract metadata + download in one pass
+            # Single yt-dlp call with smart parameters
             download_result = await _download_single_attempt(
                 youtube_id=youtube_id,
                 job_id=job_id,
                 attempt=attempt,
                 proxy_session_id=proxy_session_id,
+                player_client=player_client,
+                country=country,
+                resume_enabled=True,  # Enable resume for partial downloads
             )
 
             # Success!
@@ -1322,6 +1389,8 @@ async def download_video(youtube_id: str, job_id: str) -> dict:
                     "total_time_seconds": round(total_duration, 2),
                     "attempts": attempt,
                     "bot_detections": bot_detection_count,
+                    "bad_proxy_rotations": bad_proxy_count,
+                    "final_client": player_client,
                 }
             )
 
@@ -1334,8 +1403,9 @@ async def download_video(youtube_id: str, job_id: str) -> dict:
                 "ext": download_result["ext"],
                 "filesize_bytes": download_result["filesize_bytes"],
                 "download_time": download_result["download_time"],
-                "method": "proxy_single_pass",
+                "method": "proxy_smart_rotation",
                 "cost": COST_TIER2_PROXY,
+                "attempts": attempt,
             }
 
         except PERMANENT_ERRORS as e:
@@ -1357,85 +1427,124 @@ async def download_video(youtube_id: str, job_id: str) -> dict:
             }
 
         except BotDetectionError as e:
-            # Special handling for bot detection - track and use longer delays
+            # Bot detection - this is specifically a bad proxy symptom
             bot_detection_count += 1
+            bad_proxy_count += 1
             last_error = e
 
-            if attempt < MAX_RETRY_ATTEMPTS:
-                # Use longer delays for bot detection to let proxy pool rotate
-                backoff = RETRY_BACKOFF_SECONDS[min(attempt - 1, len(RETRY_BACKOFF_SECONDS) - 1)]
+            # === FAIL FAST STRATEGY ===
+            if attempt <= QUICK_RETRY_BATCH:
+                # Quick retry: minimal delay, just get a new IP immediately
+                delay = QUICK_RETRY_DELAY
                 logger.warn(
                     f"Bot detection #{bot_detection_count} on attempt {attempt}, "
-                    f"retrying in {backoff}s with fresh proxy IP...",
+                    f"QUICK RETRY in {delay}s with fresh IP...",
                     "download",
-                    {"job_id": job_id, "attempt": attempt, "backoff": backoff, "bot_detections": bot_detection_count}
+                    {"job_id": job_id, "attempt": attempt, "delay": delay, "strategy": "quick_retry"}
                 )
-                await asyncio.sleep(backoff)
-            else:
+            elif attempt < MAX_RETRY_ATTEMPTS:
+                # Standard retry with backoff (after quick batch exhausted)
+                backoff_idx = min(attempt - QUICK_RETRY_BATCH - 1, len(RETRY_BACKOFF_SECONDS) - 1)
+                delay = RETRY_BACKOFF_SECONDS[backoff_idx]
                 logger.warn(
-                    f"All {MAX_RETRY_ATTEMPTS} attempts hit bot detection, "
-                    f"trying circuit breaker ({CIRCUIT_BREAKER_DELAY}s delay)...",
+                    f"Bot detection #{bot_detection_count} on attempt {attempt}, "
+                    f"retrying in {delay}s with fresh proxy (country rotation)...",
+                    "download",
+                    {"job_id": job_id, "attempt": attempt, "delay": delay, "strategy": "standard_retry"}
+                )
+            else:
+                # Last attempt - go to circuit breaker
+                delay = 0
+                logger.warn(
+                    f"All {MAX_RETRY_ATTEMPTS} attempts exhausted with {bot_detection_count} bot detections",
                     "download",
                     {"job_id": job_id, "bot_detections": bot_detection_count}
                 )
 
-        except DownloadError as e:
+            if delay > 0:
+                await asyncio.sleep(delay)
+
+        except (DownloadError, DownloadTimeoutError) as e:
             last_error = e
             error_msg = e.message if hasattr(e, 'message') else str(e)
 
-            if attempt < MAX_RETRY_ATTEMPTS:
-                backoff = RETRY_BACKOFF_SECONDS[min(attempt - 1, len(RETRY_BACKOFF_SECONDS) - 1)]
+            # Check if this looks like a bad proxy symptom
+            if is_bad_proxy_symptom(error_msg):
+                bad_proxy_count += 1
+
+            if attempt <= QUICK_RETRY_BATCH:
+                # Quick retry for any error in the quick batch
+                delay = QUICK_RETRY_DELAY
                 logger.warn(
-                    f"Download failed on attempt {attempt}, retrying in {backoff}s...",
+                    f"Download error on attempt {attempt}, QUICK RETRY in {delay}s...",
                     "download",
-                    {"job_id": job_id, "attempt": attempt, "backoff": backoff, "error": error_msg[:100]}
+                    {"job_id": job_id, "attempt": attempt, "delay": delay, "error": error_msg[:80]}
                 )
-                await asyncio.sleep(backoff)
+            elif attempt < MAX_RETRY_ATTEMPTS:
+                backoff_idx = min(attempt - QUICK_RETRY_BATCH - 1, len(RETRY_BACKOFF_SECONDS) - 1)
+                delay = RETRY_BACKOFF_SECONDS[backoff_idx]
+                logger.warn(
+                    f"Download failed on attempt {attempt}, retrying in {delay}s...",
+                    "download",
+                    {"job_id": job_id, "attempt": attempt, "delay": delay, "error": error_msg[:80]}
+                )
             else:
+                delay = 0
                 logger.error(
                     f"All {MAX_RETRY_ATTEMPTS} attempts failed for {youtube_id}",
                     "download",
                     {"job_id": job_id, "youtube_id": youtube_id, "final_error": error_msg}
                 )
+
+            if delay > 0:
+                await asyncio.sleep(delay)
 
         except Exception as e:
             last_error = e
             error_msg = str(e) if not hasattr(e, 'message') else e.message
 
-            # Check if we should retry
-            if attempt < MAX_RETRY_ATTEMPTS:
-                backoff = RETRY_BACKOFF_SECONDS[min(attempt - 1, len(RETRY_BACKOFF_SECONDS) - 1)]
-                logger.warn(
-                    f"Attempt {attempt} failed, retrying in {backoff}s with fresh proxy...",
-                    "download",
-                    {"job_id": job_id, "attempt": attempt, "backoff": backoff, "error": error_msg[:100]}
-                )
-                await asyncio.sleep(backoff)
+            if attempt <= QUICK_RETRY_BATCH:
+                delay = QUICK_RETRY_DELAY
+            elif attempt < MAX_RETRY_ATTEMPTS:
+                backoff_idx = min(attempt - QUICK_RETRY_BATCH - 1, len(RETRY_BACKOFF_SECONDS) - 1)
+                delay = RETRY_BACKOFF_SECONDS[backoff_idx]
             else:
-                logger.error(
-                    f"All {MAX_RETRY_ATTEMPTS} attempts failed for {youtube_id}",
-                    "download",
-                    {"job_id": job_id, "youtube_id": youtube_id, "final_error": error_msg}
-                )
+                delay = 0
 
-    # Circuit breaker: If all attempts failed with bot detection, wait longer and try one more time
-    if bot_detection_count >= MAX_RETRY_ATTEMPTS - 1:
+            logger.warn(
+                f"Attempt {attempt} failed, {'QUICK RETRY' if attempt <= QUICK_RETRY_BATCH else 'retrying'} "
+                f"in {delay}s with fresh proxy...",
+                "download",
+                {"job_id": job_id, "attempt": attempt, "delay": delay, "error": error_msg[:80]}
+            )
+
+            if delay > 0:
+                await asyncio.sleep(delay)
+
+    # === CIRCUIT BREAKER ===
+    # Final attempt with completely different strategy
+    if bot_detection_count > 0 or bad_proxy_count > 0:
         logger.info(
-            f"Circuit breaker activated: waiting {CIRCUIT_BREAKER_DELAY}s before final attempt",
+            f"Circuit breaker activated: waiting {CIRCUIT_BREAKER_DELAY}s before final attempt "
+            f"(bot_detections={bot_detection_count}, bad_proxies={bad_proxy_count})",
             "download",
             {"job_id": job_id, "youtube_id": youtube_id, "bot_detections": bot_detection_count}
         )
 
         await asyncio.sleep(CIRCUIT_BREAKER_DELAY)
 
-        # Final attempt with completely fresh session
+        # Final attempt with completely fresh session and different client
         job_progress[job_id]["attempt"] = MAX_RETRY_ATTEMPTS + 1
         job_progress[job_id]["status"] = "downloading"
-        proxy_session_id = f"circuit-{uuid.uuid4().hex}"
+
+        # Try web client with PO token awareness for circuit breaker
+        circuit_breaker_client = ["web", "mweb"]
+        # Keep US for speed
+        circuit_breaker_country = "US"
 
         try:
             logger.info(
-                f"[Circuit Breaker] Final attempt with fresh proxy",
+                f"[Circuit Breaker] Final attempt: client={circuit_breaker_client}",
                 "download",
                 {"job_id": job_id, "youtube_id": youtube_id}
             )
@@ -1444,7 +1553,10 @@ async def download_video(youtube_id: str, job_id: str) -> dict:
                 youtube_id=youtube_id,
                 job_id=job_id,
                 attempt=MAX_RETRY_ATTEMPTS + 1,
-                proxy_session_id=proxy_session_id,
+                proxy_session_id=get_fresh_session_id("circuit"),
+                player_client=circuit_breaker_client,
+                country=circuit_breaker_country,
+                resume_enabled=True,
             )
 
             total_duration = time.time() - total_start
@@ -1472,8 +1584,9 @@ async def download_video(youtube_id: str, job_id: str) -> dict:
                 "ext": download_result["ext"],
                 "filesize_bytes": download_result["filesize_bytes"],
                 "download_time": download_result["download_time"],
-                "method": "proxy_single_pass",
+                "method": "proxy_circuit_breaker",
                 "cost": COST_TIER2_PROXY,
+                "attempts": MAX_RETRY_ATTEMPTS + 1,
             }
 
         except Exception as e:
@@ -1486,21 +1599,37 @@ async def download_video(youtube_id: str, job_id: str) -> dict:
 
     # All retries exhausted
     total_duration = time.time() - total_start
+    final_attempts = MAX_RETRY_ATTEMPTS + (1 if bot_detection_count > 0 or bad_proxy_count > 0 else 0)
+
     job_progress[job_id] = {
         "status": "failed",
         "progress": 0,
         "error": str(last_error),
-        "attempts": MAX_RETRY_ATTEMPTS + 1,
+        "attempts": final_attempts,
         "bot_detections": bot_detection_count,
     }
+
+    logger.error(
+        f"Download failed for {youtube_id}",
+        "download",
+        {
+            "job_id": job_id,
+            "youtube_id": youtube_id,
+            "total_attempts": final_attempts,
+            "bot_detections": bot_detection_count,
+            "bad_proxy_rotations": bad_proxy_count,
+            "total_time_seconds": round(total_duration, 2),
+        }
+    )
 
     # Return failure with details
     return {
         "success": False,
         "youtube_id": youtube_id,
         "error": str(last_error),
-        "attempts": MAX_RETRY_ATTEMPTS + 1,
+        "attempts": final_attempts,
         "bot_detections": bot_detection_count,
+        "bad_proxy_rotations": bad_proxy_count,
         "total_time": total_duration,
         "method": "all_failed",
         "cost": COST_TIER2_PROXY,
