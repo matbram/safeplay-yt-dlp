@@ -13,7 +13,10 @@ from app.config import settings
 from app.services import logger
 
 # === RELIABILITY CONFIGURATION ===
-UPLOAD_TIMEOUT_SECONDS = 45  # Max time for upload (generous for large files)
+# Dynamic timeout: base + (file_size_mb * per_mb_seconds), capped at max
+UPLOAD_TIMEOUT_BASE_SECONDS = 60  # Base timeout for small files
+UPLOAD_TIMEOUT_PER_MB_SECONDS = 10  # Additional seconds per MB (assumes ~100KB/s minimum speed)
+UPLOAD_TIMEOUT_MAX_SECONDS = 300  # Maximum timeout (5 minutes cap)
 
 # Initialize Supabase client
 supabase: Client = create_client(
@@ -65,10 +68,18 @@ async def upload_to_supabase(
 
         file_size = len(file_content)
         read_time = time.time() - start_time
+
+        # Calculate dynamic timeout based on file size
+        file_size_mb = file_size / (1024 * 1024)
+        upload_timeout = min(
+            UPLOAD_TIMEOUT_MAX_SECONDS,
+            UPLOAD_TIMEOUT_BASE_SECONDS + int(file_size_mb * UPLOAD_TIMEOUT_PER_MB_SECONDS)
+        )
+
         logger.info(
-            f"File read complete: {file_size / (1024*1024):.2f} MB in {read_time:.2f}s",
+            f"File read complete: {file_size_mb:.2f} MB in {read_time:.2f}s (upload timeout: {upload_timeout}s)",
             "storage",
-            {"job_id": job_id, "filesize_bytes": file_size, "read_time_seconds": read_time}
+            {"job_id": job_id, "filesize_bytes": file_size, "read_time_seconds": read_time, "upload_timeout": upload_timeout}
         )
 
         # Determine content type (audio formats for transcription)
@@ -101,29 +112,29 @@ async def upload_to_supabase(
         try:
             loop = asyncio.get_event_loop()
             upload_task = loop.run_in_executor(_upload_executor, _blocking_upload)
-            await asyncio.wait_for(upload_task, timeout=UPLOAD_TIMEOUT_SECONDS)
+            await asyncio.wait_for(upload_task, timeout=upload_timeout)
         except asyncio.TimeoutError:
             upload_time = time.time() - upload_start
             logger.error(
                 f"Upload timed out after {upload_time:.1f}s",
                 "storage",
-                {"job_id": job_id, "timeout": UPLOAD_TIMEOUT_SECONDS, "filesize_mb": file_size / (1024*1024)}
+                {"job_id": job_id, "timeout": upload_timeout, "filesize_mb": file_size_mb}
             )
             return {
                 "success": False,
-                "error": f"Upload timed out after {UPLOAD_TIMEOUT_SECONDS}s",
+                "error": f"Upload timed out after {upload_timeout}s",
             }
         upload_time = time.time() - upload_start
 
         logger.success(
-            f"Upload complete: {storage_path} ({file_size / (1024*1024):.2f} MB in {upload_time:.2f}s)",
+            f"Upload complete: {storage_path} ({file_size_mb:.2f} MB in {upload_time:.2f}s)",
             "storage",
             {
                 "job_id": job_id,
                 "storage_path": storage_path,
                 "filesize_bytes": file_size,
                 "upload_time_seconds": upload_time,
-                "upload_speed_mbps": (file_size / (1024*1024)) / upload_time if upload_time > 0 else 0
+                "upload_speed_mbps": file_size_mb / upload_time if upload_time > 0 else 0
             }
         )
 
