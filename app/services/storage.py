@@ -71,16 +71,17 @@ async def upload_to_supabase(
             {"job_id": job_id, "filesize_bytes": file_size, "read_time_seconds": read_time}
         )
 
-        # Determine content type (audio formats for transcription)
+        # Determine content type based on file extension
         content_types = {
             ".m4a": "audio/mp4",
+            ".mp4": "video/mp4",  # Combined video+audio container
             ".mp3": "audio/mpeg",
-            ".webm": "audio/webm",
+            ".webm": "video/webm",  # Can be audio or video
             ".ogg": "audio/ogg",
             ".opus": "audio/opus",
             ".wav": "audio/wav",
         }
-        content_type = content_types.get(file_ext.lower(), "audio/mp4")
+        content_type = content_types.get(file_ext.lower(), "video/mp4")
 
         # Upload to Supabase Storage (run in thread pool for parallel execution)
         logger.info(

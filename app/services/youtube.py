@@ -86,9 +86,14 @@ ARIA2C_MIN_CONNECTIONS = 2  # Minimum after backoff
 # 3. Less likely to trigger bot detection than audio-only streams
 #
 # Format priority:
-# 1. worst[ext=mp4][acodec!=none] - smallest combined mp4 (e.g., 360p)
-# 2. worst - fallback to any worst format
-DOWNLOAD_FORMAT = "worst[ext=mp4][acodec!=none]/worst[ext=mp4]/worst"
+# 1. worst[ext=mp4][acodec!=none] - smallest combined mp4 (e.g., 360p itag 18)
+# 2. worstvideo[ext=mp4]+worstaudio[ext=m4a] - merge smallest DASH streams
+# 3. worstvideo+worstaudio/worst - fallback to any format
+DOWNLOAD_FORMAT = "worst[ext=mp4][acodec!=none]/worstvideo[ext=mp4]+worstaudio[ext=m4a]/worstvideo+worstaudio/worst"
+
+# Minimum expected file size in bytes (1KB per second of video at minimum)
+# A 3-minute video should be at least 180KB, use 500 bytes/sec as floor
+MIN_BYTES_PER_SECOND = 500
 
 # Thread pool for running blocking downloads (8 workers for parallel capacity)
 _download_executor = ThreadPoolExecutor(max_workers=8, thread_name_prefix="ytdlp")
@@ -586,6 +591,33 @@ async def download_tier1_po_token(
 
         info = download_result["info"]
         download_time = download_result["duration"]
+        filesize = download_result["filesize"]
+        duration = info.get("duration", 0)
+
+        # Validate file size - reject suspiciously small files
+        # A video should be at least MIN_BYTES_PER_SECOND per second of content
+        if duration > 0 and filesize > 0:
+            min_expected_size = duration * MIN_BYTES_PER_SECOND
+            if filesize < min_expected_size:
+                logger.warn(
+                    f"[TIER 1] File suspiciously small: {filesize} bytes for {duration}s video "
+                    f"(expected at least {min_expected_size} bytes)",
+                    "download",
+                    {
+                        "job_id": job_id,
+                        "youtube_id": youtube_id,
+                        "filesize": filesize,
+                        "duration": duration,
+                        "min_expected": min_expected_size,
+                    }
+                )
+                method_cache.record_failure(youtube_id, DownloadMethod.TIER1_PO_TOKEN, FailureReason.UNKNOWN)
+                return DownloadResult(
+                    success=False,
+                    youtube_id=youtube_id,
+                    method=DownloadMethod.TIER1_PO_TOKEN,
+                    error=f"Downloaded file too small ({filesize} bytes for {duration}s video)"
+                )
 
         # Success!
         method_cache.record_success(youtube_id, DownloadMethod.TIER1_PO_TOKEN)
@@ -1506,6 +1538,19 @@ async def download_video(youtube_id: str, job_id: str) -> dict:
                 title=metadata_result["title"],
                 proxy_url=proxy_url,  # Use same proxy session for IP-bound URLs
             )
+
+            # Validate file size - reject suspiciously small files
+            filesize = download_result["filesize_bytes"]
+            duration = metadata_result["duration_seconds"]
+            if duration > 0 and filesize > 0:
+                min_expected_size = duration * MIN_BYTES_PER_SECOND
+                if filesize < min_expected_size:
+                    logger.warn(
+                        f"[TIER 2] File suspiciously small: {filesize} bytes for {duration}s video",
+                        "download",
+                        {"job_id": job_id, "youtube_id": youtube_id, "filesize": filesize, "duration": duration}
+                    )
+                    raise DownloadError(f"Downloaded file too small ({filesize} bytes for {duration}s video)")
 
             # Success! Record in cache and return
             total_duration = time.time() - total_start
