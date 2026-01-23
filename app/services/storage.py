@@ -1,7 +1,7 @@
 """Supabase storage operations for video uploads."""
 
 import asyncio
-import aiofiles
+import os
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -13,7 +13,7 @@ from app.config import settings
 from app.services import logger
 
 # === RELIABILITY CONFIGURATION ===
-UPLOAD_TIMEOUT_SECONDS = 45  # Max time for upload (generous for large files)
+UPLOAD_TIMEOUT_SECONDS = 120  # Max time for upload (increased for large files)
 
 # Initialize Supabase client
 supabase: Client = create_client(
@@ -33,7 +33,7 @@ async def upload_to_supabase(
     job_id: str
 ) -> dict:
     """
-    Upload a video file to Supabase Storage.
+    Upload a video file to Supabase Storage using streaming (memory-efficient).
 
     Args:
         local_file_path: Path to the local file
@@ -44,9 +44,9 @@ async def upload_to_supabase(
         dict: Upload result with storage_path and filesize_bytes
     """
     file_path = Path(local_file_path)
-    file_ext = file_path.suffix  # .m4a, .webm, .mp3, etc.
+    file_ext = file_path.suffix  # .m4a, .webm, .mp3, .mp4, etc.
 
-    # Storage path structure: {youtube_id}/audio.m4a
+    # Storage path structure: {youtube_id}/audio.mp4
     storage_path = f"{youtube_id}/audio{file_ext}"
 
     logger.info(
@@ -56,22 +56,15 @@ async def upload_to_supabase(
     )
 
     try:
-        # Read file content
-        start_time = time.time()
-        logger.debug(f"Reading file: {local_file_path}", "storage", {"job_id": job_id})
-
-        async with aiofiles.open(local_file_path, "rb") as f:
-            file_content = await f.read()
-
-        file_size = len(file_content)
-        read_time = time.time() - start_time
+        # Get file size without reading into memory
+        file_size = os.path.getsize(local_file_path)
         logger.info(
-            f"File read complete: {file_size / (1024*1024):.2f} MB in {read_time:.2f}s",
+            f"File size: {file_size / (1024*1024):.2f} MB",
             "storage",
-            {"job_id": job_id, "filesize_bytes": file_size, "read_time_seconds": read_time}
+            {"job_id": job_id, "filesize_bytes": file_size}
         )
 
-        # Determine content type (audio formats for transcription)
+        # Determine content type
         content_types = {
             ".m4a": "audio/mp4",
             ".mp3": "audio/mpeg",
@@ -79,23 +72,26 @@ async def upload_to_supabase(
             ".ogg": "audio/ogg",
             ".opus": "audio/opus",
             ".wav": "audio/wav",
+            ".mp4": "video/mp4",
         }
-        content_type = content_types.get(file_ext.lower(), "audio/mp4")
+        content_type = content_types.get(file_ext.lower(), "video/mp4")
 
-        # Upload to Supabase Storage (run in thread pool for parallel execution)
+        # Upload to Supabase Storage using file path (streams, doesn't load into memory)
         logger.info(
-            f"Uploading to Supabase bucket '{settings.STORAGE_BUCKET}'...",
+            f"Uploading to Supabase bucket '{settings.STORAGE_BUCKET}' (streaming)...",
             "storage",
             {"job_id": job_id, "bucket": settings.STORAGE_BUCKET, "path": storage_path, "content_type": content_type}
         )
 
         def _blocking_upload():
-            """Run the blocking Supabase upload in a thread."""
-            supabase.storage.from_(settings.STORAGE_BUCKET).upload(
-                path=storage_path,
-                file=file_content,
-                file_options={"content-type": content_type, "upsert": "true"}
-            )
+            """Run the blocking Supabase upload in a thread using file streaming."""
+            # Open file in binary read mode - Supabase client will stream it
+            with open(local_file_path, "rb") as f:
+                supabase.storage.from_(settings.STORAGE_BUCKET).upload(
+                    path=storage_path,
+                    file=f,
+                    file_options={"content-type": content_type, "upsert": "true"}
+                )
 
         upload_start = time.time()
         try:
