@@ -64,13 +64,14 @@ RETRY_BACKOFF_SECONDS = [1, 2, 3]  # Shorter backoff for remaining retries
 CIRCUIT_BREAKER_DELAY = 10  # Reduced - we've already tried many IPs
 
 # === PLAYER CLIENT ROTATION ===
-# Try multiple player clients - some have better bot detection tolerance
+# Try multiple player clients - prioritize those that return progressive (non-SABR) URLs
+# tv_embedded returns progressive downloads without PO token requirements
 PLAYER_CLIENTS = [
-    ["android"],           # Most reliable for non-age-restricted
-    ["ios"],               # Good fallback
-    ["web"],               # Standard web client
-    ["mweb"],              # Mobile web - sometimes bypasses checks
-    ["android", "ios"],    # Combined - yt-dlp tries both
+    ["tv_embedded"],       # Returns progressive URLs, no PO token needed
+    ["mediaconnect"],      # Another client that may return progressive URLs
+    ["android"],           # May need PO token but sometimes works
+    ["ios"],               # May need PO token but sometimes works
+    ["web"],               # Often forces SABR streaming now
 ]
 
 # Thread pool for running blocking downloads (8 workers for parallel capacity)
@@ -490,8 +491,7 @@ async def extract_audio_url(
         "extractor_args": {
             "youtube": {
                 "lang": ["en", "en-US", "en-GB"],
-                "player_client": ["web"],
-                "skip": ["dash", "hls"],  # Skip SABR/segmented formats for single-file downloads
+                "player_client": ["tv_embedded"],  # Returns progressive URLs without SABR
             }
         },
     }
@@ -936,7 +936,6 @@ async def _download_single_attempt(
             "youtube": {
                 "lang": ["en", "en-US", "en-GB"],
                 "player_client": player_client,
-                "skip": ["dash", "hls"],  # Skip SABR/segmented formats for single-file downloads
             }
         },
     }
