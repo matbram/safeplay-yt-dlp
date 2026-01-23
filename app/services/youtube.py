@@ -491,6 +491,7 @@ async def extract_audio_url(
             "youtube": {
                 "lang": ["en", "en-US", "en-GB"],
                 "player_client": ["web"],
+                "skip": ["dash", "hls"],  # Skip SABR/segmented formats for single-file downloads
             }
         },
     }
@@ -935,6 +936,7 @@ async def _download_single_attempt(
             "youtube": {
                 "lang": ["en", "en-US", "en-GB"],
                 "player_client": player_client,
+                "skip": ["dash", "hls"],  # Skip SABR/segmented formats for single-file downloads
             }
         },
     }
