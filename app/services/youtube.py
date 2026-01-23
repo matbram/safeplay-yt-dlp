@@ -494,8 +494,8 @@ async def download_tier1_po_token(
         "verbose": True,
         "logger": ytdlp_logger,
         "outtmpl": str(temp_dir / "%(id)s.%(ext)s"),
-        # Audio format selection - prefer English, lowest quality for transcription
-        "format": "worstaudio[language=en]/worstaudio[language^=en]/worstaudio",
+        # Worst video quality - fastest downloads, sufficient for processing
+        "format": "worstvideo+worstaudio/worst",
         "geo_bypass": True,
         "socket_timeout": 30,
         # NO PROXY - direct download with PO token from bgutil plugin
@@ -722,8 +722,8 @@ async def extract_audio_url(
         "logger": ytdlp_logger,
         "skip_download": True,  # CRITICAL: Don't download, just extract info
         "extract_flat": False,  # We need full format info with URLs
-        # Audio format selection - prefer English, lowest quality for transcription
-        "format": "worstaudio[language=en]/worstaudio[language^=en]/worstaudio",
+        # Worst video quality - fastest downloads, sufficient for processing
+        "format": "worstvideo+worstaudio/worst",
         "geo_bypass": True,
         "socket_timeout": 30,
         # Prefer English audio track
@@ -1131,10 +1131,8 @@ async def _download_single_attempt(
     ydl_opts = {
         **proxy_config,
         "outtmpl": str(temp_dir / f"{youtube_id}.%(ext)s"),
-        # Lowest quality audio - sufficient for transcription, smallest files
-        # Prefer English audio, fall back to original/any if not available
-        # YouTube videos often have multiple dubbed audio tracks
-        "format": "worstaudio[language=en]/worstaudio[language^=en]/worstaudio",
+        # Worst video quality - fastest downloads, sufficient for processing
+        "format": "worstvideo+worstaudio/worst",
         "progress_hooks": [lambda d: _progress_hook(d, job_id)],
         "verbose": True,
         "logger": ytdlp_logger,
