@@ -480,17 +480,17 @@ async def extract_audio_url(
         "skip_download": True,  # CRITICAL: Don't download, just extract info
         "extract_flat": False,  # We need full format info with URLs
         # Audio-only - lowest bitrate for smallest files
-        # Format: prefer HTTPS audio, fallback to any audio, then any best
-        "format": "bestaudio[protocol=https]/bestaudio/best",
-        # Sort by bitrate ascending (~64kbps target) to get lowest quality audio
-        "format_sort": ["abr:64"],
+        # IMPORTANT: Do NOT include 'best' fallback as it includes video
+        "format": "worstaudio[protocol=https]/worstaudio",
+        "format_sort": ["abr"],
         "geo_bypass": True,
         "socket_timeout": 30,
         # Prefer English audio track
+        # Use web client to avoid PO token requirements for audio formats
         "extractor_args": {
             "youtube": {
                 "lang": ["en", "en-US", "en-GB"],
-                "player_client": ["android"],
+                "player_client": ["web"],
             }
         },
     }
@@ -915,8 +915,9 @@ async def _download_single_attempt(
         "retries": proxy_config.get("retries", 2),
         "outtmpl": str(temp_dir / f"{youtube_id}.%(ext)s"),
         # Audio-only - lowest bitrate for smallest files
-        "format": "bestaudio[protocol=https]/bestaudio/best",
-        "format_sort": ["abr:64"],
+        # IMPORTANT: Do NOT include 'best' fallback as it includes video
+        "format": "worstaudio[protocol=https]/worstaudio",
+        "format_sort": ["abr"],
         "progress_hooks": [lambda d: _progress_hook(d, job_id)],
         "verbose": True,
         "logger": ytdlp_logger,
@@ -929,11 +930,11 @@ async def _download_single_attempt(
         "buffersize": 1024 * 64,
         "http_chunk_size": 10485760,
         # Prefer English audio track
-        # Use specified player client(s)
+        # Use web client to avoid PO token requirements for audio formats
         "extractor_args": {
             "youtube": {
-                "lang": ["en", "en-US", "en-GB"],  # Prefer English
-                "player_client": player_client,
+                "lang": ["en", "en-US", "en-GB"],
+                "player_client": ["web"],
             }
         },
     }
