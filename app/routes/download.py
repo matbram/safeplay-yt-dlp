@@ -116,12 +116,36 @@ async def download_video_endpoint(
                 }
             )
 
-        # Update progress to uploading
-        youtube.update_job_progress(request.job_id, "uploading", 80)
+        # Extract audio from video (ElevenLabs requires audio-only files)
+        youtube.update_job_progress(request.job_id, "extracting", 75)
 
-        # Upload to Supabase Storage
+        audio_result = await youtube.extract_audio_from_video(
+            video_path=result["file_path"],
+            job_id=request.job_id,
+        )
+
+        if not audio_result.get("success"):
+            logger.error(
+                f"Audio extraction failed for {request.youtube_id}",
+                "download",
+                {"job_id": request.job_id, "error": audio_result.get("error")}
+            )
+            raise HTTPException(
+                status_code=500,
+                detail={
+                    "error_code": "AUDIO_EXTRACTION_FAILED",
+                    "message": audio_result.get("error", "Audio extraction failed"),
+                    "retryable": True,
+                    "user_message": "Failed to process the video. Please try again.",
+                }
+            )
+
+        # Update progress to uploading
+        youtube.update_job_progress(request.job_id, "uploading", 85)
+
+        # Upload extracted audio to Supabase Storage
         upload_result = await storage.upload_to_supabase(
-            local_file_path=result["file_path"],
+            local_file_path=audio_result["audio_path"],
             youtube_id=request.youtube_id,
             job_id=request.job_id,
         )
@@ -229,10 +253,28 @@ async def _process_single_video(
                 user_message="Download failed. Please try again.",
             )
 
-        # Upload to Supabase Storage
-        youtube.update_job_progress(job_id, "uploading", 80)
+        # Extract audio from video (ElevenLabs requires audio-only files)
+        youtube.update_job_progress(job_id, "extracting", 75)
+        audio_result = await youtube.extract_audio_from_video(
+            video_path=result["file_path"],
+            job_id=job_id,
+        )
+
+        if not audio_result.get("success"):
+            return BatchDownloadResultItem(
+                youtube_id=youtube_id,
+                job_id=job_id,
+                status="failed",
+                error=audio_result.get("error", "Audio extraction failed"),
+                error_code="AUDIO_EXTRACTION_FAILED",
+                retryable=True,
+                user_message="Failed to process the video. Please try again.",
+            )
+
+        # Upload extracted audio to Supabase Storage
+        youtube.update_job_progress(job_id, "uploading", 85)
         upload_result = await storage.upload_to_supabase(
-            local_file_path=result["file_path"],
+            local_file_path=audio_result["audio_path"],
             youtube_id=youtube_id,
             job_id=job_id,
         )
