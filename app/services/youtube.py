@@ -46,8 +46,6 @@ from app.services.proxy import (
     is_bad_proxy_symptom,
     mark_session_bad,
     get_fresh_session_id,
-    get_next_fallback_country,
-    FALLBACK_COUNTRIES,
 )
 from app.services import logger
 from app.services.po_token import get_token_manager
@@ -1346,16 +1344,12 @@ async def download_video(youtube_id: str, job_id: str) -> dict:
         player_client_idx = (attempt - 1) % len(PLAYER_CLIENTS)
         player_client = PLAYER_CLIENTS[player_client_idx]
 
-        # 3. Rotate country after quick retry batch exhausted
-        if attempt <= QUICK_RETRY_BATCH:
-            country = "US"  # Stick with US for quick retries
-        else:
-            # Rotate through fallback countries
-            country = get_next_fallback_country(attempt - QUICK_RETRY_BATCH)
+        # 3. Always use US for fastest CDN connection
+        country = "US"
 
         logger.info(
             f"[Attempt {attempt}/{MAX_RETRY_ATTEMPTS}] Smart rotation: "
-            f"client={player_client}, country={country}, "
+            f"client={player_client}, "
             f"{'QUICK' if attempt <= QUICK_RETRY_BATCH else 'STANDARD'} retry",
             "download",
             {
@@ -1363,7 +1357,6 @@ async def download_video(youtube_id: str, job_id: str) -> dict:
                 "youtube_id": youtube_id,
                 "attempt": attempt,
                 "player_client": player_client,
-                "country": country,
                 "is_quick_retry": attempt <= QUICK_RETRY_BATCH,
             }
         )
@@ -1397,7 +1390,6 @@ async def download_video(youtube_id: str, job_id: str) -> dict:
                     "attempts": attempt,
                     "bot_detections": bot_detection_count,
                     "bad_proxy_rotations": bad_proxy_count,
-                    "final_country": country,
                     "final_client": player_client,
                 }
             )
@@ -1547,12 +1539,12 @@ async def download_video(youtube_id: str, job_id: str) -> dict:
 
         # Try web client with PO token awareness for circuit breaker
         circuit_breaker_client = ["web", "mweb"]
-        # Try a completely different country
-        circuit_breaker_country = "GB" if bad_proxy_count > 2 else "CA"
+        # Keep US for speed
+        circuit_breaker_country = "US"
 
         try:
             logger.info(
-                f"[Circuit Breaker] Final attempt: client={circuit_breaker_client}, country={circuit_breaker_country}",
+                f"[Circuit Breaker] Final attempt: client={circuit_breaker_client}",
                 "download",
                 {"job_id": job_id, "youtube_id": youtube_id}
             )
