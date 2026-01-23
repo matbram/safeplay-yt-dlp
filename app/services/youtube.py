@@ -130,15 +130,6 @@ def _check_nodejs_available() -> bool:
         return False
 
 
-def _check_ffmpeg_available() -> bool:
-    """Check if ffmpeg is available for audio extraction."""
-    try:
-        result = subprocess.run(["ffmpeg", "-version"], capture_output=True, timeout=5)
-        return result.returncode == 0
-    except Exception:
-        return False
-
-
 # Check aria2c availability at startup
 ARIA2C_AVAILABLE = _check_aria2c_available()
 if ARIA2C_AVAILABLE:
@@ -152,13 +143,6 @@ if NODEJS_AVAILABLE:
     logger.info("Node.js detected - will use for YouTube JS challenges", "ytdlp")
 else:
     logger.error("Node.js NOT found - YouTube downloads may fail with bot detection! Install with: apt install nodejs", "ytdlp")
-
-# Check ffmpeg availability at startup (required for audio extraction from video)
-FFMPEG_AVAILABLE = _check_ffmpeg_available()
-if FFMPEG_AVAILABLE:
-    logger.info("ffmpeg detected - will use for audio extraction from video", "ytdlp")
-else:
-    logger.warn("ffmpeg not found - audio extraction will fail! Install with: apt install ffmpeg", "ytdlp")
 
 
 # === COST TRACKING ===
@@ -1874,130 +1858,6 @@ def cleanup_old_temp_files(max_age_hours: int = 24) -> int:
         logger.info(f"Cleaned up {cleaned} old temp directories", "download")
 
     return cleaned
-
-
-async def extract_audio_from_video(
-    video_path: str,
-    job_id: str,
-) -> dict:
-    """
-    Extract audio from video file using ffmpeg.
-
-    This is necessary because:
-    1. We download combined mp4 (video+audio) for speed and reliability
-    2. ElevenLabs requires audio-only files for transcription
-    3. ffmpeg can extract audio without re-encoding (fast, lossless)
-
-    Command: ffmpeg -i input.mp4 -vn -acodec copy output.m4a
-
-    Args:
-        video_path: Path to the downloaded video file
-        job_id: Job ID for logging
-
-    Returns:
-        dict: {success: bool, audio_path: str, filesize_bytes: int}
-    """
-    if not FFMPEG_AVAILABLE:
-        logger.error(
-            "ffmpeg not available - cannot extract audio",
-            "download",
-            {"job_id": job_id}
-        )
-        return {"success": False, "error": "ffmpeg not installed"}
-
-    video_file = Path(video_path)
-    if not video_file.exists():
-        return {"success": False, "error": f"Video file not found: {video_path}"}
-
-    # Output audio file (same directory, .m4a extension)
-    audio_file = video_file.with_suffix(".m4a")
-
-    logger.info(
-        f"Extracting audio from video: {video_file.name} -> {audio_file.name}",
-        "download",
-        {"job_id": job_id, "video_path": str(video_file), "audio_path": str(audio_file)}
-    )
-
-    start_time = time.time()
-
-    # ffmpeg command to extract audio without re-encoding
-    # -i: input file
-    # -vn: no video
-    # -acodec copy: copy audio codec (no re-encoding, fast)
-    # -y: overwrite output file if exists
-    cmd = [
-        "ffmpeg",
-        "-i", str(video_file),
-        "-vn",  # No video
-        "-acodec", "copy",  # Copy audio stream (no re-encoding)
-        "-y",  # Overwrite if exists
-        str(audio_file),
-    ]
-
-    def _run_ffmpeg():
-        """Run ffmpeg in subprocess."""
-        return subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=60,  # 60 second timeout for extraction
-        )
-
-    try:
-        loop = asyncio.get_event_loop()
-        process = await asyncio.wait_for(
-            loop.run_in_executor(_download_executor, _run_ffmpeg),
-            timeout=60,
-        )
-
-        extraction_time = time.time() - start_time
-
-        if process.returncode != 0:
-            error_msg = process.stderr or process.stdout or "Unknown ffmpeg error"
-            logger.error(
-                f"ffmpeg audio extraction failed: {error_msg[:200]}",
-                "download",
-                {"job_id": job_id, "returncode": process.returncode}
-            )
-            return {"success": False, "error": f"ffmpeg error: {error_msg[:100]}"}
-
-        if not audio_file.exists():
-            return {"success": False, "error": "Audio file not created"}
-
-        filesize = audio_file.stat().st_size
-
-        logger.success(
-            f"Audio extracted: {audio_file.name} ({filesize / 1024:.1f} KB in {extraction_time:.1f}s)",
-            "download",
-            {
-                "job_id": job_id,
-                "audio_path": str(audio_file),
-                "filesize_bytes": filesize,
-                "extraction_time": round(extraction_time, 2),
-            }
-        )
-
-        return {
-            "success": True,
-            "audio_path": str(audio_file),
-            "filesize_bytes": filesize,
-        }
-
-    except asyncio.TimeoutError:
-        logger.error(
-            "ffmpeg audio extraction timed out",
-            "download",
-            {"job_id": job_id}
-        )
-        return {"success": False, "error": "Audio extraction timed out"}
-
-    except Exception as e:
-        logger.error(
-            f"ffmpeg audio extraction exception: {str(e)[:100]}",
-            "download",
-            {"job_id": job_id}
-        )
-        return {"success": False, "error": str(e)}
 
 
 async def get_video_info(youtube_id: str) -> Optional[dict]:
