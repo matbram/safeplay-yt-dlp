@@ -81,9 +81,10 @@ ARIA2C_MIN_CONNECTIONS = 2  # Minimum after backoff
 
 # === DOWNLOAD FORMAT STRATEGY ===
 # Single combined stream only (video+audio in one container)
-# No merging of separate streams - faster and more reliable
-# Enforce HTTPS protocol for security
-DOWNLOAD_FORMAT = "worst[ext=mp4][acodec!=none][protocol=https]/worst[acodec!=none][protocol=https]/worst[ext=mp4][acodec!=none]/worst[acodec!=none]"
+# Use -S to sort by resolution and bitrate, then pick best (smallest after sort)
+# This is more reliable than using "worst" directly
+FORMAT_SORT = "res:240,+br,+size"  # Prefer 240p, then lowest bitrate, then smallest size
+DOWNLOAD_FORMAT = "best[protocol=https][ext=mp4][acodec!=none]/best[protocol=https][acodec!=none]/best[ext=mp4][acodec!=none]/best[acodec!=none]"
 
 # Minimum expected file size in bytes (1KB per second of video at minimum)
 # A 3-minute video should be at least 180KB, use 500 bytes/sec as floor
@@ -528,8 +529,10 @@ async def download_tier1_po_token(
         "quiet": False,
         "verbose": True,
         "logger": ytdlp_logger,
-        "outtmpl": str(temp_dir / "%(id)s.%(ext)s"),
-        # Single combined stream only - no merging
+        # Fixed .mp4 extension - more reliable than %(ext)s template
+        "outtmpl": str(temp_dir / f"{youtube_id}.mp4"),
+        # Sort formats to get smallest, then pick best (which is smallest after sort)
+        "format_sort": [FORMAT_SORT],
         "format": DOWNLOAD_FORMAT,
         "geo_bypass": True,
         "socket_timeout": 30,
@@ -556,6 +559,7 @@ async def download_tier1_po_token(
                 f"--max-connection-per-server={ARIA2C_START_CONNECTIONS}",
                 "--min-split-size=1M", f"--split={ARIA2C_START_CONNECTIONS}",
                 "--timeout=20", "--connect-timeout=10",
+                "--retry-wait=1", "--max-tries=0",  # Infinite retries with 1s wait
             ]
         }
 
@@ -567,13 +571,13 @@ async def download_tier1_po_token(
         """Run blocking yt-dlp download."""
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
-            ext = info.get("ext", "m4a")
-            output_file = temp_dir / f"{youtube_id}.{ext}"
+            # Fixed .mp4 output path
+            output_file = temp_dir / f"{youtube_id}.mp4"
             filesize = output_file.stat().st_size if output_file.exists() else 0
 
             return {
                 "info": info,
-                "ext": ext,
+                "ext": "mp4",
                 "output_file": output_file,
                 "filesize": filesize,
                 "duration": time.time() - start_time,
@@ -788,7 +792,8 @@ async def extract_audio_url(
         "logger": ytdlp_logger,
         "skip_download": True,  # CRITICAL: Don't download, just extract info
         "extract_flat": False,  # We need full format info with URLs
-        # Single combined stream only - no merging
+        # Sort formats to get smallest, then pick best
+        "format_sort": [FORMAT_SORT],
         "format": DOWNLOAD_FORMAT,
         "geo_bypass": True,
         "socket_timeout": 30,
@@ -1217,8 +1222,10 @@ async def _download_single_attempt(
     # yt-dlp options optimized for SPEED
     ydl_opts = {
         **proxy_config,
-        "outtmpl": str(temp_dir / f"{youtube_id}.%(ext)s"),
-        # Single combined stream only - no merging
+        # Fixed .mp4 extension - more reliable than %(ext)s template
+        "outtmpl": str(temp_dir / f"{youtube_id}.mp4"),
+        # Sort formats to get smallest, then pick best
+        "format_sort": [FORMAT_SORT],
         "format": DOWNLOAD_FORMAT,
         "progress_hooks": [lambda d: _progress_hook(d, job_id)],
         "verbose": True,
@@ -1258,6 +1265,7 @@ async def _download_single_attempt(
                 f"--max-connection-per-server={ARIA2C_START_CONNECTIONS}",
                 "--min-split-size=1M", f"--split={ARIA2C_START_CONNECTIONS}",
                 "--timeout=20", "--connect-timeout=10",
+                "--retry-wait=1", "--max-tries=0",  # Infinite retries with 1s wait
             ]
         }
 
@@ -1267,13 +1275,13 @@ async def _download_single_attempt(
         """Run blocking yt-dlp download."""
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
-            ext = info.get("ext", "mp4")
-            output_file = temp_dir / f"{youtube_id}.{ext}"
+            # Fixed .mp4 output path
+            output_file = temp_dir / f"{youtube_id}.mp4"
             filesize = output_file.stat().st_size if output_file.exists() else 0
 
             return {
                 "info": info,
-                "ext": ext,
+                "ext": "mp4",
                 "output_file": output_file,
                 "filesize": filesize,
                 "duration": time.time() - start_time,
