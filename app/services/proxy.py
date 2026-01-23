@@ -1,6 +1,7 @@
 """OxyLabs residential proxy configuration for yt-dlp with speed optimizations."""
 
 import uuid
+from urllib.parse import quote
 from app.config import settings
 from app.services import logger
 
@@ -40,10 +41,14 @@ def get_proxy_config(job_id: str = None) -> dict:
     # - cc-US: Country targeting (no city - adds overhead without benefit)
     # - sessid: Unique session ID keeps same IP for all requests
     # - sesstime: Session duration in minutes
+    #
+    # IMPORTANT: URL-encode the password to handle special characters like + ~ etc.
+    # Without encoding, + is interpreted as space, causing random auth failures.
+    encoded_password = quote(settings.OXYLABS_PASSWORD, safe='')
     proxy_url = (
         f"http://{settings.OXYLABS_USERNAME}-cc-{PROXY_COUNTRY}"
         f"-sessid-{session_id}-sesstime-{SESSION_TIME_MINUTES}"
-        f":{settings.OXYLABS_PASSWORD}@pr.oxylabs.io:7777"
+        f":{encoded_password}@pr.oxylabs.io:7777"
     )
 
     logger.debug(
@@ -68,8 +73,9 @@ def get_rotating_proxy() -> str:
     Returns:
         str: Proxy URL string
     """
+    encoded_password = quote(settings.OXYLABS_PASSWORD, safe='')
     return (
-        f"http://{settings.OXYLABS_USERNAME}:{settings.OXYLABS_PASSWORD}"
+        f"http://{settings.OXYLABS_USERNAME}:{encoded_password}"
         f"@pr.oxylabs.io:7777"
     )
 
@@ -84,9 +90,10 @@ def get_country_proxy(country_code: str = "us") -> str:
     Returns:
         str: Country-specific proxy URL
     """
+    encoded_password = quote(settings.OXYLABS_PASSWORD, safe='')
     return (
         f"http://{settings.OXYLABS_USERNAME}-country-{country_code}"
-        f":{settings.OXYLABS_PASSWORD}@pr.oxylabs.io:7777"
+        f":{encoded_password}@pr.oxylabs.io:7777"
     )
 
 

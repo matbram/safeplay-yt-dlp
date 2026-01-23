@@ -29,6 +29,7 @@ EXPECTED COSTS:
 """
 
 import asyncio
+import random
 import shutil
 import subprocess
 import time
@@ -72,8 +73,43 @@ MAX_RETRY_ATTEMPTS = 5  # Number of retry attempts (increased for bot detection)
 RETRY_BACKOFF_SECONDS = [1, 2, 5, 10]  # Escalating backoff - longer delays help get fresh IPs
 CIRCUIT_BREAKER_DELAY = 30  # Final attempt after this delay if all retries fail with bot detection
 
+# === ARIA2C CONNECTION SETTINGS ===
+# YouTube sweet spot is 6-8 connections through residential proxies.
+# 16+ triggers bot walls and 403s. Start moderate and back off on failures.
+ARIA2C_START_CONNECTIONS = 8  # Initial connection count
+ARIA2C_MIN_CONNECTIONS = 2  # Minimum after backoff
+
+# === DOWNLOAD FORMAT STRATEGY ===
+# Single combined stream only (video+audio in one container)
+# Use -S to sort by resolution and bitrate, then pick best (smallest after sort)
+# This is more reliable than using "worst" directly
+FORMAT_SORT = "res:240,+br,+size"  # Prefer 240p, then lowest bitrate, then smallest size
+DOWNLOAD_FORMAT = "best[protocol=https][ext=mp4][acodec!=none]/best[protocol=https][acodec!=none]/best[ext=mp4][acodec!=none]/best[acodec!=none]"
+
+# Minimum expected file size in bytes (1KB per second of video at minimum)
+# A 3-minute video should be at least 180KB, use 500 bytes/sec as floor
+MIN_BYTES_PER_SECOND = 500
+
 # Thread pool for running blocking downloads (8 workers for parallel capacity)
 _download_executor = ThreadPoolExecutor(max_workers=8, thread_name_prefix="ytdlp")
+
+
+def _get_backoff_with_jitter(attempt: int) -> float:
+    """
+    Get backoff delay with jitter for the given attempt number.
+
+    Jitter helps prevent thundering herd when multiple downloads retry simultaneously.
+    Formula: base_backoff + random(0, 3) seconds
+
+    Args:
+        attempt: Current attempt number (1-based)
+
+    Returns:
+        float: Backoff delay in seconds with jitter added
+    """
+    base_backoff = RETRY_BACKOFF_SECONDS[min(attempt - 1, len(RETRY_BACKOFF_SECONDS) - 1)]
+    jitter = random.uniform(0, 3)  # Add 0-3 seconds of jitter
+    return base_backoff + jitter
 
 
 def _check_aria2c_available() -> bool:
@@ -493,11 +529,15 @@ async def download_tier1_po_token(
         "quiet": False,
         "verbose": True,
         "logger": ytdlp_logger,
-        "outtmpl": str(temp_dir / "%(id)s.%(ext)s"),
-        # Worst video quality - fastest downloads, sufficient for processing
-        "format": "worstvideo+worstaudio/worst",
+        # Fixed .mp4 extension - more reliable than %(ext)s template
+        "outtmpl": str(temp_dir / f"{youtube_id}.mp4"),
+        # Sort formats to get smallest, then pick best (which is smallest after sort)
+        "format_sort": [FORMAT_SORT],
+        "format": DOWNLOAD_FORMAT,
         "geo_bypass": True,
         "socket_timeout": 30,
+        # Force IPv4 - more reliable through proxies
+        "source_address": "0.0.0.0",
         # NO PROXY - direct download with PO token from bgutil plugin
         # Prefer English audio track
         "extractor_args": {
@@ -508,15 +548,18 @@ async def download_tier1_po_token(
     }
 
     # Enable aria2c for multi-connection download if available
+    # Use moderate concurrency (8) - YouTube sweet spot for residential proxies
     if ARIA2C_AVAILABLE:
+        conns = str(ARIA2C_START_CONNECTIONS)
         ydl_opts["external_downloader"] = "aria2c"
         ydl_opts["external_downloader_args"] = {
             "aria2c": [
-                "-x", "16", "-s", "16", "-k", "1M",
+                "-x", conns, "-s", conns, "-k", "1M",
                 "--file-allocation=none",
-                "--max-connection-per-server=16",
-                "--min-split-size=1M", "--split=16",
-                "--timeout=30",
+                f"--max-connection-per-server={ARIA2C_START_CONNECTIONS}",
+                "--min-split-size=1M", f"--split={ARIA2C_START_CONNECTIONS}",
+                "--timeout=20", "--connect-timeout=10",
+                "--retry-wait=1", "--max-tries=0",  # Infinite retries with 1s wait
             ]
         }
 
@@ -528,13 +571,13 @@ async def download_tier1_po_token(
         """Run blocking yt-dlp download."""
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
-            ext = info.get("ext", "m4a")
-            output_file = temp_dir / f"{youtube_id}.{ext}"
+            # Fixed .mp4 output path
+            output_file = temp_dir / f"{youtube_id}.mp4"
             filesize = output_file.stat().st_size if output_file.exists() else 0
 
             return {
                 "info": info,
-                "ext": ext,
+                "ext": "mp4",
                 "output_file": output_file,
                 "filesize": filesize,
                 "duration": time.time() - start_time,
@@ -548,6 +591,33 @@ async def download_tier1_po_token(
 
         info = download_result["info"]
         download_time = download_result["duration"]
+        filesize = download_result["filesize"]
+        duration = info.get("duration", 0)
+
+        # Validate file size - reject suspiciously small files
+        # A video should be at least MIN_BYTES_PER_SECOND per second of content
+        if duration > 0 and filesize > 0:
+            min_expected_size = duration * MIN_BYTES_PER_SECOND
+            if filesize < min_expected_size:
+                logger.warn(
+                    f"[TIER 1] File suspiciously small: {filesize} bytes for {duration}s video "
+                    f"(expected at least {min_expected_size} bytes)",
+                    "download",
+                    {
+                        "job_id": job_id,
+                        "youtube_id": youtube_id,
+                        "filesize": filesize,
+                        "duration": duration,
+                        "min_expected": min_expected_size,
+                    }
+                )
+                method_cache.record_failure(youtube_id, DownloadMethod.TIER1_PO_TOKEN, FailureReason.UNKNOWN)
+                return DownloadResult(
+                    success=False,
+                    youtube_id=youtube_id,
+                    method=DownloadMethod.TIER1_PO_TOKEN,
+                    error=f"Downloaded file too small ({filesize} bytes for {duration}s video)"
+                )
 
         # Success!
         method_cache.record_success(youtube_id, DownloadMethod.TIER1_PO_TOKEN)
@@ -722,10 +792,13 @@ async def extract_audio_url(
         "logger": ytdlp_logger,
         "skip_download": True,  # CRITICAL: Don't download, just extract info
         "extract_flat": False,  # We need full format info with URLs
-        # Worst video quality - fastest downloads, sufficient for processing
-        "format": "worstvideo+worstaudio/worst",
+        # Sort formats to get smallest, then pick best
+        "format_sort": [FORMAT_SORT],
+        "format": DOWNLOAD_FORMAT,
         "geo_bypass": True,
         "socket_timeout": 30,
+        # Force IPv4 - more reliable through proxies
+        "source_address": "0.0.0.0",
         # Prefer English audio track
         "extractor_args": {
             "youtube": {
@@ -769,29 +842,43 @@ async def extract_audio_url(
 
         # If not directly available, look in requested_formats
         if not cdn_url and info.get("requested_formats"):
-            # Get the audio format (should be first/only with worstaudio)
+            # Get the first format with a URL (combined mp4 should be single stream)
             for fmt in info["requested_formats"]:
-                if fmt.get("acodec") != "none":
+                if fmt.get("url"):
                     cdn_url = fmt.get("url")
                     break
 
-        # Fallback: look in formats list for audio
+        # Fallback: look in formats list for combined mp4 (video+audio in one stream)
         if not cdn_url and info.get("formats"):
-            # Find the worst quality audio format
-            audio_formats = [f for f in info["formats"] if f.get("acodec") != "none" and f.get("vcodec") == "none"]
-            if audio_formats:
-                # Sort by quality (filesize or tbr)
-                audio_formats.sort(key=lambda f: f.get("filesize") or f.get("tbr") or 0)
-                cdn_url = audio_formats[0].get("url")
+            # Find combined formats (have both video and audio codecs)
+            # These are single-stream mp4s like itag 18 (360p)
+            combined_formats = [
+                f for f in info["formats"]
+                if f.get("acodec") != "none"
+                and f.get("vcodec") != "none"
+                and f.get("ext") == "mp4"
+                and f.get("url")
+            ]
+            if combined_formats:
+                # Sort by quality (filesize or height) - prefer smallest
+                combined_formats.sort(key=lambda f: f.get("filesize") or f.get("height") or 0)
+                cdn_url = combined_formats[0].get("url")
+
+            # Final fallback: any format with audio
+            if not cdn_url:
+                audio_formats = [f for f in info["formats"] if f.get("acodec") != "none" and f.get("url")]
+                if audio_formats:
+                    audio_formats.sort(key=lambda f: f.get("filesize") or f.get("tbr") or 0)
+                    cdn_url = audio_formats[0].get("url")
 
         if not cdn_url:
             raise DownloadError(
                 f"Could not extract CDN URL for {youtube_id}. "
-                "No audio format URLs found in metadata."
+                "No suitable format URLs found in metadata."
             )
 
-        # Get file extension and size
-        ext = info.get("ext", "m4a")
+        # Get file extension and size (default to mp4 for combined formats)
+        ext = info.get("ext", "mp4")
         filesize_approx = info.get("filesize") or info.get("filesize_approx") or 0
 
         logger.success(
@@ -943,35 +1030,40 @@ async def _download_with_aria2c(
     output_file: Path,
     job_id: str,
     proxy_url: str = None,
+    connections: int = None,
 ) -> dict:
     """
     Download file using aria2c with multi-connection support.
 
-    Uses the same aria2c configuration as the existing yt-dlp integration:
-    - 16 connections per server
-    - 16 concurrent segments
-    - 1MB minimum segment size
-    - Optional proxy support for IP-bound YouTube URLs
+    YouTube through residential proxies has a sweet spot of 6-8 connections.
+    Higher values (16+) trigger bot walls and 403s.
 
     Args:
         cdn_url: The CDN URL to download from
         output_file: Path to save the downloaded file
         job_id: Job ID for logging
         proxy_url: Optional proxy URL (required for IP-bound YouTube URLs)
+        connections: Number of connections (defaults to ARIA2C_START_CONNECTIONS)
     """
-    # aria2c command with same options as existing yt-dlp integration
+    # Use provided connections or default
+    conns = connections if connections is not None else ARIA2C_START_CONNECTIONS
+    conns_str = str(conns)
+
+    # aria2c command optimized for YouTube through residential proxies
     cmd = [
         "aria2c",
-        "-x", "16",  # Max connections per server
-        "-s", "16",  # Split file into segments
+        "-x", conns_str,  # Max connections per server
+        "-s", conns_str,  # Split file into segments
         "-k", "1M",  # Min split size
-        "--max-connection-per-server=16",
+        f"--max-connection-per-server={conns}",
         "--min-split-size=1M",
-        "--split=16",
-        "--timeout=30",
+        f"--split={conns}",
+        "--timeout=20",  # Reduced from 30 for faster failure detection
+        "--connect-timeout=10",
         "--file-allocation=none",
         "--auto-file-renaming=false",
         "--allow-overwrite=true",
+        "--console-log-level=warn",
         "-d", str(output_file.parent),
         "-o", output_file.name,
     ]
@@ -985,9 +1077,9 @@ async def _download_with_aria2c(
 
     using_proxy = "via same proxy" if proxy_url else "no proxy"
     logger.debug(
-        f"[PHASE 2] Executing aria2c (16 connections, {using_proxy})",
+        f"[PHASE 2] Executing aria2c ({conns} connections, {using_proxy})",
         "download",
-        {"job_id": job_id, "output": str(output_file), "using_proxy": bool(proxy_url)}
+        {"job_id": job_id, "output": str(output_file), "using_proxy": bool(proxy_url), "connections": conns}
     )
 
     def _run_aria2c():
@@ -1130,9 +1222,11 @@ async def _download_single_attempt(
     # yt-dlp options optimized for SPEED
     ydl_opts = {
         **proxy_config,
-        "outtmpl": str(temp_dir / f"{youtube_id}.%(ext)s"),
-        # Worst video quality - fastest downloads, sufficient for processing
-        "format": "worstvideo+worstaudio/worst",
+        # Fixed .mp4 extension - more reliable than %(ext)s template
+        "outtmpl": str(temp_dir / f"{youtube_id}.mp4"),
+        # Sort formats to get smallest, then pick best
+        "format_sort": [FORMAT_SORT],
+        "format": DOWNLOAD_FORMAT,
         "progress_hooks": [lambda d: _progress_hook(d, job_id)],
         "verbose": True,
         "logger": ytdlp_logger,
@@ -1141,7 +1235,9 @@ async def _download_single_attempt(
         "fragment_retries": 3,
         "noplaylist": True,
         "geo_bypass": True,
-        "socket_timeout": 30,  # Socket timeout for speed
+        "socket_timeout": 30,
+        # Force IPv4 - more reliable through proxies
+        "source_address": "0.0.0.0",
         # Speed optimizations
         "concurrent_fragment_downloads": 8,
         "buffersize": 1024 * 64,
@@ -1149,7 +1245,7 @@ async def _download_single_attempt(
         # Prefer original/English audio track
         "extractor_args": {
             "youtube": {
-                "lang": ["en", "en-US", "en-GB"],  # Prefer English
+                "lang": ["en", "en-US", "en-GB"],
             }
         },
     }
@@ -1158,16 +1254,18 @@ async def _download_single_attempt(
     if NODEJS_AVAILABLE:
         ydl_opts["js_runtimes"] = {"node": {}}
 
-    # Use aria2c if available
+    # Use aria2c if available with moderate concurrency
     if ARIA2C_AVAILABLE:
+        conns = str(ARIA2C_START_CONNECTIONS)
         ydl_opts["external_downloader"] = "aria2c"
         ydl_opts["external_downloader_args"] = {
             "aria2c": [
-                "-x", "16", "-s", "16", "-k", "1M",
+                "-x", conns, "-s", conns, "-k", "1M",
                 "--file-allocation=none",
-                "--max-connection-per-server=16",
-                "--min-split-size=1M", "--split=16",
-                "--timeout=30",  # aria2c timeout
+                f"--max-connection-per-server={ARIA2C_START_CONNECTIONS}",
+                "--min-split-size=1M", f"--split={ARIA2C_START_CONNECTIONS}",
+                "--timeout=20", "--connect-timeout=10",
+                "--retry-wait=1", "--max-tries=0",  # Infinite retries with 1s wait
             ]
         }
 
@@ -1177,13 +1275,13 @@ async def _download_single_attempt(
         """Run blocking yt-dlp download."""
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
-            ext = info.get("ext", "mp4")
-            output_file = temp_dir / f"{youtube_id}.{ext}"
+            # Fixed .mp4 output path
+            output_file = temp_dir / f"{youtube_id}.mp4"
             filesize = output_file.stat().st_size if output_file.exists() else 0
 
             return {
                 "info": info,
-                "ext": ext,
+                "ext": "mp4",
                 "output_file": output_file,
                 "filesize": filesize,
                 "duration": time.time() - start_time,
@@ -1449,6 +1547,19 @@ async def download_video(youtube_id: str, job_id: str) -> dict:
                 proxy_url=proxy_url,  # Use same proxy session for IP-bound URLs
             )
 
+            # Validate file size - reject suspiciously small files
+            filesize = download_result["filesize_bytes"]
+            duration = metadata_result["duration_seconds"]
+            if duration > 0 and filesize > 0:
+                min_expected_size = duration * MIN_BYTES_PER_SECOND
+                if filesize < min_expected_size:
+                    logger.warn(
+                        f"[TIER 2] File suspiciously small: {filesize} bytes for {duration}s video",
+                        "download",
+                        {"job_id": job_id, "youtube_id": youtube_id, "filesize": filesize, "duration": duration}
+                    )
+                    raise DownloadError(f"Downloaded file too small ({filesize} bytes for {duration}s video)")
+
             # Success! Record in cache and return
             total_duration = time.time() - total_start
             job_progress[job_id]["progress"] = 75
@@ -1510,12 +1621,13 @@ async def download_video(youtube_id: str, job_id: str) -> dict:
 
             if attempt < MAX_RETRY_ATTEMPTS:
                 # Use longer delays for bot detection to let proxy pool rotate
-                backoff = RETRY_BACKOFF_SECONDS[min(attempt - 1, len(RETRY_BACKOFF_SECONDS) - 1)]
+                # Jitter prevents thundering herd when multiple downloads retry
+                backoff = _get_backoff_with_jitter(attempt)
                 logger.warn(
                     f"[TIER 2] Bot detection #{bot_detection_count} on attempt {attempt}, "
-                    f"retrying in {backoff}s with fresh proxy IP...",
+                    f"retrying in {backoff:.1f}s with fresh proxy IP...",
                     "download",
-                    {"job_id": job_id, "attempt": attempt, "backoff": backoff, "bot_detections": bot_detection_count}
+                    {"job_id": job_id, "attempt": attempt, "backoff": round(backoff, 1), "bot_detections": bot_detection_count}
                 )
                 await asyncio.sleep(backoff)
             else:
@@ -1532,12 +1644,12 @@ async def download_video(youtube_id: str, job_id: str) -> dict:
             error_msg = e.message if hasattr(e, 'message') else str(e)
 
             if attempt < MAX_RETRY_ATTEMPTS:
-                backoff = RETRY_BACKOFF_SECONDS[min(attempt - 1, len(RETRY_BACKOFF_SECONDS) - 1)]
+                backoff = _get_backoff_with_jitter(attempt)
                 logger.warn(
                     f"[TIER 2] CDN download failed on attempt {attempt}, "
-                    f"will refresh URL in {backoff}s...",
+                    f"will refresh URL in {backoff:.1f}s...",
                     "download",
-                    {"job_id": job_id, "attempt": attempt, "backoff": backoff, "error": error_msg[:100]}
+                    {"job_id": job_id, "attempt": attempt, "backoff": round(backoff, 1), "error": error_msg[:100]}
                 )
                 await asyncio.sleep(backoff)
             else:
@@ -1553,11 +1665,11 @@ async def download_video(youtube_id: str, job_id: str) -> dict:
 
             # Check if we should retry
             if attempt < MAX_RETRY_ATTEMPTS:
-                backoff = RETRY_BACKOFF_SECONDS[min(attempt - 1, len(RETRY_BACKOFF_SECONDS) - 1)]
+                backoff = _get_backoff_with_jitter(attempt)
                 logger.warn(
-                    f"[TIER 2] Attempt {attempt} failed, retrying in {backoff}s with fresh proxy...",
+                    f"[TIER 2] Attempt {attempt} failed, retrying in {backoff:.1f}s with fresh proxy...",
                     "download",
-                    {"job_id": job_id, "attempt": attempt, "backoff": backoff, "error": error_msg[:100]}
+                    {"job_id": job_id, "attempt": attempt, "backoff": round(backoff, 1), "error": error_msg[:100]}
                 )
                 await asyncio.sleep(backoff)
             else:
