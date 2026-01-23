@@ -80,16 +80,10 @@ ARIA2C_START_CONNECTIONS = 8  # Initial connection count
 ARIA2C_MIN_CONNECTIONS = 2  # Minimum after backoff
 
 # === DOWNLOAD FORMAT STRATEGY ===
-# Key insight: Single mp4 streams (video+audio in one container) are:
-# 1. Faster - single stream, no merging needed
-# 2. More reliable - video formats are cached better on YouTube CDN
-# 3. Less likely to trigger bot detection than audio-only streams
-#
-# Format priority:
-# 1. worst[ext=mp4][acodec!=none] - smallest combined mp4 (e.g., 360p itag 18)
-# 2. worstvideo[ext=mp4]+worstaudio[ext=m4a] - merge smallest DASH streams
-# 3. worstvideo+worstaudio/worst - fallback to any format
-DOWNLOAD_FORMAT = "worst[ext=mp4][acodec!=none]/worstvideo[ext=mp4]+worstaudio[ext=m4a]/worstvideo+worstaudio/worst"
+# Single combined stream only (video+audio in one container)
+# No merging of separate streams - faster and more reliable
+# Enforce HTTPS protocol for security
+DOWNLOAD_FORMAT = "worst[ext=mp4][acodec!=none][protocol=https]/worst[acodec!=none][protocol=https]/worst[ext=mp4][acodec!=none]/worst[acodec!=none]"
 
 # Minimum expected file size in bytes (1KB per second of video at minimum)
 # A 3-minute video should be at least 180KB, use 500 bytes/sec as floor
@@ -535,10 +529,12 @@ async def download_tier1_po_token(
         "verbose": True,
         "logger": ytdlp_logger,
         "outtmpl": str(temp_dir / "%(id)s.%(ext)s"),
-        # Single mp4 stream - faster and more reliable than separate video+audio
+        # Single combined stream only - no merging
         "format": DOWNLOAD_FORMAT,
         "geo_bypass": True,
         "socket_timeout": 30,
+        # Force IPv4 - more reliable through proxies
+        "source_address": "0.0.0.0",
         # NO PROXY - direct download with PO token from bgutil plugin
         # Prefer English audio track
         "extractor_args": {
@@ -792,10 +788,12 @@ async def extract_audio_url(
         "logger": ytdlp_logger,
         "skip_download": True,  # CRITICAL: Don't download, just extract info
         "extract_flat": False,  # We need full format info with URLs
-        # Single mp4 stream - faster and more reliable than separate video+audio
+        # Single combined stream only - no merging
         "format": DOWNLOAD_FORMAT,
         "geo_bypass": True,
         "socket_timeout": 30,
+        # Force IPv4 - more reliable through proxies
+        "source_address": "0.0.0.0",
         # Prefer English audio track
         "extractor_args": {
             "youtube": {
@@ -1220,7 +1218,7 @@ async def _download_single_attempt(
     ydl_opts = {
         **proxy_config,
         "outtmpl": str(temp_dir / f"{youtube_id}.%(ext)s"),
-        # Single mp4 stream - faster and more reliable than separate video+audio
+        # Single combined stream only - no merging
         "format": DOWNLOAD_FORMAT,
         "progress_hooks": [lambda d: _progress_hook(d, job_id)],
         "verbose": True,
@@ -1230,7 +1228,9 @@ async def _download_single_attempt(
         "fragment_retries": 3,
         "noplaylist": True,
         "geo_bypass": True,
-        "socket_timeout": 30,  # Socket timeout for speed
+        "socket_timeout": 30,
+        # Force IPv4 - more reliable through proxies
+        "source_address": "0.0.0.0",
         # Speed optimizations
         "concurrent_fragment_downloads": 8,
         "buffersize": 1024 * 64,
@@ -1238,7 +1238,7 @@ async def _download_single_attempt(
         # Prefer original/English audio track
         "extractor_args": {
             "youtube": {
-                "lang": ["en", "en-US", "en-GB"],  # Prefer English
+                "lang": ["en", "en-US", "en-GB"],
             }
         },
     }
