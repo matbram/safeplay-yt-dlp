@@ -62,6 +62,7 @@ QUICK_RETRY_BATCH = 2  # Quick retry same client once, then rotate
 QUICK_RETRY_DELAY = 0.5  # Very short delay for quick retries (just get a fresh IP)
 RETRY_BACKOFF_SECONDS = [1, 2, 3]  # Shorter backoff for remaining retries
 CIRCUIT_BREAKER_DELAY = 5  # Reduced - faster circuit breaker with better clients
+MIN_DOWNLOAD_SPEED_KB = 250  # Minimum acceptable download speed in KB/s (abort if slower)
 
 # === PLAYER CLIENT ROTATION ===
 # Optimized order: prioritize clients that provide non-SABR progressive downloads
@@ -876,6 +877,7 @@ async def _download_single_attempt(
     player_client: list[str] = None,
     country: str = None,
     resume_enabled: bool = True,
+    is_final_attempt: bool = False,
 ) -> dict:
     """
     Execute a single download attempt with timeout.
@@ -888,6 +890,7 @@ async def _download_single_attempt(
         player_client: List of player clients to try (default: android)
         country: Country code for proxy (default: US)
         resume_enabled: Whether to enable download resume (default: True)
+        is_final_attempt: If True, disable speed limit to ensure download completes
 
     Returns:
         dict with download result or raises exception
@@ -971,6 +974,12 @@ async def _download_single_attempt(
             "--connect-timeout=10",  # Faster connection timeout
             "--max-resume-failure-tries=5",  # Better resume handling
         ]
+        # Only enforce speed limit if NOT the final attempt
+        # On final attempt, let the download complete even if slow
+        if not is_final_attempt:
+            aria2c_args.append(f"--lowest-speed-limit={MIN_DOWNLOAD_SPEED_KB}K")
+        else:
+            logger.info("Final attempt: speed limit disabled, will complete even if slow", "download")
         # Enable resume if requested
         if resume_enabled:
             aria2c_args.extend(["--continue=true", "--auto-file-renaming=false"])
@@ -1277,85 +1286,87 @@ async def download_video(youtube_id: str, job_id: str) -> dict:
                 await asyncio.sleep(delay)
 
     # === CIRCUIT BREAKER ===
-    # Final attempt with completely different strategy
-    if bot_detection_count > 0 or bad_proxy_count > 0:
+    # ALWAYS run a final attempt after all regular attempts fail
+    # This attempt disables the speed limit to ensure the download completes
+    # even if the proxy is slow - better to finish slowly than not at all
+    logger.info(
+        f"Circuit breaker activated: waiting {CIRCUIT_BREAKER_DELAY}s before final attempt "
+        f"(bot_detections={bot_detection_count}, bad_proxies={bad_proxy_count})",
+        "download",
+        {"job_id": job_id, "youtube_id": youtube_id, "bot_detections": bot_detection_count}
+    )
+
+    await asyncio.sleep(CIRCUIT_BREAKER_DELAY)
+
+    # Final attempt with completely fresh session and different client
+    job_progress[job_id]["attempt"] = MAX_RETRY_ATTEMPTS + 1
+    job_progress[job_id]["status"] = "downloading"
+
+    # Circuit breaker uses the most reliable combination that worked in testing
+    # web_safari + android_sdkless worked well when other clients failed
+    circuit_breaker_client = ["web_safari", "android_sdkless"]
+    # Keep US for speed
+    circuit_breaker_country = "US"
+
+    try:
         logger.info(
-            f"Circuit breaker activated: waiting {CIRCUIT_BREAKER_DELAY}s before final attempt "
-            f"(bot_detections={bot_detection_count}, bad_proxies={bad_proxy_count})",
+            f"[Circuit Breaker] Final attempt: client={circuit_breaker_client}",
             "download",
-            {"job_id": job_id, "youtube_id": youtube_id, "bot_detections": bot_detection_count}
+            {"job_id": job_id, "youtube_id": youtube_id}
         )
 
-        await asyncio.sleep(CIRCUIT_BREAKER_DELAY)
+        download_result = await _download_single_attempt(
+            youtube_id=youtube_id,
+            job_id=job_id,
+            attempt=MAX_RETRY_ATTEMPTS + 1,
+            proxy_session_id=get_fresh_session_id("circuit"),
+            player_client=circuit_breaker_client,
+            country=circuit_breaker_country,
+            resume_enabled=True,
+            is_final_attempt=True,  # Disable speed limit - complete even if slow
+        )
 
-        # Final attempt with completely fresh session and different client
-        job_progress[job_id]["attempt"] = MAX_RETRY_ATTEMPTS + 1
-        job_progress[job_id]["status"] = "downloading"
+        total_duration = time.time() - total_start
 
-        # Circuit breaker uses the most reliable combination that worked in testing
-        # web_safari + android_sdkless worked well when other clients failed
-        circuit_breaker_client = ["web_safari", "android_sdkless"]
-        # Keep US for speed
-        circuit_breaker_country = "US"
-
-        try:
-            logger.info(
-                f"[Circuit Breaker] Final attempt: client={circuit_breaker_client}",
-                "download",
-                {"job_id": job_id, "youtube_id": youtube_id}
-            )
-
-            download_result = await _download_single_attempt(
-                youtube_id=youtube_id,
-                job_id=job_id,
-                attempt=MAX_RETRY_ATTEMPTS + 1,
-                proxy_session_id=get_fresh_session_id("circuit"),
-                player_client=circuit_breaker_client,
-                country=circuit_breaker_country,
-                resume_enabled=True,
-            )
-
-            total_duration = time.time() - total_start
-
-            logger.success(
-                f"[Circuit Breaker SUCCESS] {download_result['title'][:50]}",
-                "download",
-                {
-                    "job_id": job_id,
-                    "youtube_id": youtube_id,
-                    "title": download_result["title"][:50],
-                    "total_time_seconds": round(total_duration, 2),
-                    "attempts": MAX_RETRY_ATTEMPTS + 1,
-                    "bot_detections": bot_detection_count,
-                    "circuit_breaker": True,
-                }
-            )
-
-            return {
-                "success": True,
-                "file_path": download_result["file_path"],
-                "title": download_result["title"],
-                "duration_seconds": download_result["duration_seconds"],
+        logger.success(
+            f"[Circuit Breaker SUCCESS] {download_result['title'][:50]}",
+            "download",
+            {
+                "job_id": job_id,
                 "youtube_id": youtube_id,
-                "ext": download_result["ext"],
-                "filesize_bytes": download_result["filesize_bytes"],
-                "download_time": download_result["download_time"],
-                "method": "proxy_circuit_breaker",
-                "cost": COST_PER_DOWNLOAD,
+                "title": download_result["title"][:50],
+                "total_time_seconds": round(total_duration, 2),
                 "attempts": MAX_RETRY_ATTEMPTS + 1,
+                "bot_detections": bot_detection_count,
+                "circuit_breaker": True,
             }
+        )
 
-        except Exception as e:
-            last_error = e
-            logger.error(
-                f"Circuit breaker failed for {youtube_id}",
-                "download",
-                {"job_id": job_id, "error": str(e)[:100]}
-            )
+        return {
+            "success": True,
+            "file_path": download_result["file_path"],
+            "title": download_result["title"],
+            "duration_seconds": download_result["duration_seconds"],
+            "youtube_id": youtube_id,
+            "ext": download_result["ext"],
+            "filesize_bytes": download_result["filesize_bytes"],
+            "download_time": download_result["download_time"],
+            "method": "proxy_circuit_breaker",
+            "cost": COST_PER_DOWNLOAD,
+            "attempts": MAX_RETRY_ATTEMPTS + 1,
+        }
+
+    except Exception as e:
+        last_error = e
+        logger.error(
+            f"Circuit breaker failed for {youtube_id}",
+            "download",
+            {"job_id": job_id, "error": str(e)[:100]}
+        )
 
     # All retries exhausted
     total_duration = time.time() - total_start
-    final_attempts = MAX_RETRY_ATTEMPTS + (1 if bot_detection_count > 0 or bad_proxy_count > 0 else 0)
+    final_attempts = MAX_RETRY_ATTEMPTS + 1  # Always includes circuit breaker now
 
     job_progress[job_id] = {
         "status": "failed",
