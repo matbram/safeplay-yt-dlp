@@ -66,14 +66,15 @@ CIRCUIT_BREAKER_DELAY = 5  # Reduced - faster circuit breaker with better client
 # === PLAYER CLIENT ROTATION ===
 # Optimized order: prioritize clients that provide non-SABR progressive downloads
 # Key insights:
-#   - android_sdkless: Best for audio, no PO token needed, provides progressive URLs
-#   - web_safari: Works with bgutil PO tokens, sometimes avoids SABR
-#   - web: Standard client with bgutil support, but often gets SABR-only formats
+#   - android_sdkless + web_safari: BEST combo - android provides progressive URLs,
+#     web_safari provides PO token context. Neither works alone reliably.
+#   - android_sdkless alone: Gets 403 without proper auth
+#   - web_safari alone: Gets SABR-blocked formats
 #   - AVOID: android/ios require PO tokens we can't generate
 PLAYER_CLIENTS = [
-    ["android_sdkless"],       # BEST: No PO token needed, provides progressive (non-SABR) URLs
-    ["web_safari"],            # Good: Works with bgutil, often avoids SABR issues
-    ["android_sdkless", "web_safari"],  # Combined fallback that worked in testing
+    ["android_sdkless", "web_safari"],  # BEST: Combined - android URLs + safari auth
+    ["android_sdkless"],       # Fallback: Progressive URLs, may get 403
+    ["web_safari"],            # Fallback: Has bgutil PO tokens
     ["web"],                   # Standard web - bgutil PO tokens, but may get SABR
     ["mweb"],                  # Mobile web - sometimes bypasses checks
 ]
