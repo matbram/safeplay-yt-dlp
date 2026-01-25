@@ -64,16 +64,18 @@ RETRY_BACKOFF_SECONDS = [1, 2, 3]  # Shorter backoff for remaining retries
 CIRCUIT_BREAKER_DELAY = 5  # Reduced - faster circuit breaker with better clients
 
 # === PLAYER CLIENT ROTATION ===
-# Optimized order: prioritize clients that work with bgutil PO tokens
-# Key insight: bgutil can only generate PO tokens for web-based clients
-# android/ios clients require their own PO tokens which we can't generate
+# Optimized order: prioritize clients that provide non-SABR progressive downloads
+# Key insights:
+#   - android_sdkless: Best for audio, no PO token needed, provides progressive URLs
+#   - web_safari: Works with bgutil PO tokens, sometimes avoids SABR
+#   - web: Standard client with bgutil support, but often gets SABR-only formats
+#   - AVOID: android/ios require PO tokens we can't generate
 PLAYER_CLIENTS = [
-    ["web_safari"],            # BEST: Works with bgutil, often avoids SABR issues
-    ["web"],                   # Standard web - bgutil generates PO tokens for this
-    ["android_sdkless"],       # No PO token needed, works as fallback
+    ["android_sdkless"],       # BEST: No PO token needed, provides progressive (non-SABR) URLs
+    ["web_safari"],            # Good: Works with bgutil, often avoids SABR issues
+    ["android_sdkless", "web_safari"],  # Combined fallback that worked in testing
+    ["web"],                   # Standard web - bgutil PO tokens, but may get SABR
     ["mweb"],                  # Mobile web - sometimes bypasses checks
-    ["web", "web_safari"],     # Combined - yt-dlp tries both
-    ["android_sdkless", "web_safari"],  # Fallback combination that worked in testing
 ]
 
 # Thread pool for running blocking downloads (8 workers for parallel capacity)
@@ -494,7 +496,9 @@ async def extract_audio_url(
             "youtube": {
                 "lang": ["en", "en-US", "en-GB"],
                 "player_client": ["web"],
-                "skip": ["dash", "hls"],  # Skip SABR/segmented formats for single-file downloads
+                # SABR Prevention - force single-file progressive downloads
+                "skip": ["dash", "hls"],  # Skip DASH/HLS manifests entirely
+                "formats": "missing_pot:skip",  # Skip formats that would require SABR (missing PO token URLs)
             }
         },
     }
@@ -939,7 +943,9 @@ async def _download_single_attempt(
             "youtube": {
                 "lang": ["en", "en-US", "en-GB"],
                 "player_client": player_client,
-                "skip": ["dash", "hls"],  # Skip SABR/segmented formats for single-file downloads
+                # SABR Prevention - force single-file progressive downloads
+                "skip": ["dash", "hls"],  # Skip DASH/HLS manifests entirely
+                "formats": "missing_pot:skip",  # Skip formats that would require SABR (missing PO token URLs)
             }
         },
     }
