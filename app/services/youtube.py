@@ -62,6 +62,7 @@ QUICK_RETRY_BATCH = 2  # Quick retry same client once, then rotate
 QUICK_RETRY_DELAY = 0.5  # Very short delay for quick retries (just get a fresh IP)
 RETRY_BACKOFF_SECONDS = [1, 2, 3]  # Shorter backoff for remaining retries
 CIRCUIT_BREAKER_DELAY = 5  # Reduced - faster circuit breaker with better clients
+MIN_DOWNLOAD_SPEED_KB = 100  # Minimum acceptable download speed in KB/s (abort if slower)
 
 # === PLAYER CLIENT ROTATION ===
 # Optimized order: prioritize clients that provide non-SABR progressive downloads
@@ -970,6 +971,8 @@ async def _download_single_attempt(
             "--timeout=30",
             "--connect-timeout=10",  # Faster connection timeout
             "--max-resume-failure-tries=5",  # Better resume handling
+            # Abort slow downloads - if speed drops below threshold, abort and retry with fresh proxy
+            f"--lowest-speed-limit={MIN_DOWNLOAD_SPEED_KB}K",
         ]
         # Enable resume if requested
         if resume_enabled:
