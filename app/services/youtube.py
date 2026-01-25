@@ -57,20 +57,23 @@ AGE_RESTRICTION_THRESHOLD = 18
 
 # === RELIABILITY CONFIGURATION ===
 DOWNLOAD_TIMEOUT_SECONDS = 180  # Max time for a single download attempt (3 min for large files + ffmpeg)
-MAX_RETRY_ATTEMPTS = 8  # Increased - we do quick retries with fresh IPs
-QUICK_RETRY_BATCH = 3  # Number of quick retries before adding delays
+MAX_RETRY_ATTEMPTS = 6  # Reduced - optimized client order should succeed faster
+QUICK_RETRY_BATCH = 2  # Quick retry same client once, then rotate
 QUICK_RETRY_DELAY = 0.5  # Very short delay for quick retries (just get a fresh IP)
 RETRY_BACKOFF_SECONDS = [1, 2, 3]  # Shorter backoff for remaining retries
-CIRCUIT_BREAKER_DELAY = 10  # Reduced - we've already tried many IPs
+CIRCUIT_BREAKER_DELAY = 5  # Reduced - faster circuit breaker with better clients
 
 # === PLAYER CLIENT ROTATION ===
-# Try multiple player clients - some have better bot detection tolerance
+# Optimized order: prioritize clients that work with bgutil PO tokens
+# Key insight: bgutil can only generate PO tokens for web-based clients
+# android/ios clients require their own PO tokens which we can't generate
 PLAYER_CLIENTS = [
-    ["android"],           # Most reliable for non-age-restricted
-    ["ios"],               # Good fallback
-    ["web"],               # Standard web client
-    ["mweb"],              # Mobile web - sometimes bypasses checks
-    ["android", "ios"],    # Combined - yt-dlp tries both
+    ["web_safari"],            # BEST: Works with bgutil, often avoids SABR issues
+    ["web"],                   # Standard web - bgutil generates PO tokens for this
+    ["android_sdkless"],       # No PO token needed, works as fallback
+    ["mweb"],                  # Mobile web - sometimes bypasses checks
+    ["web", "web_safari"],     # Combined - yt-dlp tries both
+    ["android_sdkless", "web_safari"],  # Fallback combination that worked in testing
 ]
 
 # Thread pool for running blocking downloads (8 workers for parallel capacity)
@@ -946,15 +949,20 @@ async def _download_single_attempt(
         ydl_opts["js_runtimes"] = {"node": {}}
 
     # Use aria2c if available with resume support
+    # Optimized for stability through residential proxies
     if ARIA2C_AVAILABLE:
         ydl_opts["external_downloader"] = "aria2c"
         aria2c_args = [
-            "-x", "8", "-s", "8", "-k", "1M",
+            # Reduced parallel connections for better proxy stability
+            # 8 connections can overwhelm residential proxies causing SSL failures
+            "-x", "4", "-s", "4", "-k", "1M",
             "--file-allocation=none",
-            "--max-connection-per-server=8",
-            "--min-split-size=1M", "--split=8",
-            "--retry-wait=1", "--max-tries=3",  # Limited retries per attempt
+            "--max-connection-per-server=4",
+            "--min-split-size=1M", "--split=4",
+            "--retry-wait=2", "--max-tries=5",  # More retries with longer wait
             "--timeout=30",
+            "--connect-timeout=10",  # Faster connection timeout
+            "--max-resume-failure-tries=5",  # Better resume handling
         ]
         # Enable resume if requested
         if resume_enabled:
@@ -1277,8 +1285,9 @@ async def download_video(youtube_id: str, job_id: str) -> dict:
         job_progress[job_id]["attempt"] = MAX_RETRY_ATTEMPTS + 1
         job_progress[job_id]["status"] = "downloading"
 
-        # Try web client with PO token awareness for circuit breaker
-        circuit_breaker_client = ["web", "mweb"]
+        # Circuit breaker uses the most reliable combination that worked in testing
+        # web_safari + android_sdkless worked well when other clients failed
+        circuit_breaker_client = ["web_safari", "android_sdkless"]
         # Keep US for speed
         circuit_breaker_country = "US"
 
