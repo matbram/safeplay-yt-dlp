@@ -1012,8 +1012,13 @@ async def _download_single_attempt(
         ydl_opts["js_runtimes"] = {"node": {}}
 
     # Use aria2c if available with resume support
-    # Optimized for stability through residential proxies
-    if ARIA2C_AVAILABLE:
+    # IMPORTANT: Disable aria2c when using proxies because:
+    # - YouTube CDN URLs are signed with the requester's IP
+    # - aria2c spawns separate connections that may exit through different IPs
+    # - This causes HTTP 403 errors due to IP mismatch
+    # - yt-dlp's internal downloader maintains the same connection
+    use_aria2c = ARIA2C_AVAILABLE and not proxy_config.get("proxy")
+    if use_aria2c:
         ydl_opts["external_downloader"] = "aria2c"
         aria2c_args = [
             # Reduced parallel connections for better proxy stability
@@ -1037,6 +1042,8 @@ async def _download_single_attempt(
         if resume_enabled:
             aria2c_args.extend(["--continue=true", "--auto-file-renaming=false"])
         ydl_opts["external_downloader_args"] = {"aria2c": aria2c_args}
+    elif ARIA2C_AVAILABLE and proxy_config.get("proxy"):
+        logger.debug("aria2c disabled for proxy download (using yt-dlp internal downloader to maintain IP consistency)", "download")
 
     start_time = time.time()
 
