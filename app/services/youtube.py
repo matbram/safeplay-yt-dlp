@@ -48,6 +48,7 @@ from app.utils.exceptions import (
     DownloadError,
     DownloadTimeoutError,
     BotDetectionError,
+    CDNAccessError,
     PERMANENT_ERRORS,
 )
 
@@ -57,7 +58,7 @@ AGE_RESTRICTION_THRESHOLD = 18
 
 # === RELIABILITY CONFIGURATION ===
 DOWNLOAD_TIMEOUT_SECONDS = 180  # Max time for a single download attempt (3 min for large files + ffmpeg)
-MAX_RETRY_ATTEMPTS = 6  # Reduced - optimized client order should succeed faster
+MAX_RETRY_ATTEMPTS = 4  # Reduced - mweb first should succeed quickly
 QUICK_RETRY_BATCH = 2  # Quick retry same client once, then rotate
 QUICK_RETRY_DELAY = 0.5  # Very short delay for quick retries (just get a fresh IP)
 RETRY_BACKOFF_SECONDS = [1, 2, 3]  # Shorter backoff for remaining retries
@@ -65,19 +66,18 @@ CIRCUIT_BREAKER_DELAY = 5  # Reduced - faster circuit breaker with better client
 MIN_DOWNLOAD_SPEED_KB = 250  # Minimum acceptable download speed in KB/s (abort if slower)
 
 # === PLAYER CLIENT ROTATION ===
-# Optimized order: prioritize clients that provide non-SABR progressive downloads
-# Key insights:
-#   - android_sdkless + web_safari: BEST combo - android provides progressive URLs,
-#     web_safari provides PO token context. Neither works alone reliably.
-#   - android_sdkless alone: Gets 403 without proper auth
-#   - web_safari alone: Gets SABR-blocked formats
-#   - AVOID: android/ios require PO tokens we can't generate
+# Optimized for residential proxy usage (tested with Oxylabs):
+# Key insights from production testing:
+#   - mweb: MOST RELIABLE with proxies - consistently works, avoids SABR
+#   - android_sdkless: Gets CDN 403 with proxies due to IP binding issues
+#   - web_safari/web: Gets SABR-blocked formats ("Requested format not available")
+# Order prioritizes mweb which has proven 100% success rate with proxies
 PLAYER_CLIENTS = [
-    ["android_sdkless", "web_safari"],  # BEST: Combined - android URLs + safari auth
-    ["android_sdkless"],       # Fallback: Progressive URLs, may get 403
-    ["web_safari"],            # Fallback: Has bgutil PO tokens
-    ["web"],                   # Standard web - bgutil PO tokens, but may get SABR
-    ["mweb"],                  # Mobile web - sometimes bypasses checks
+    ["mweb"],                  # BEST with proxies: Mobile web consistently works
+    ["android_sdkless", "mweb"],  # Fallback: Try android with mweb backup
+    ["web_safari"],            # Fallback: Has bgutil PO tokens (may get SABR)
+    ["web"],                   # Standard web - bgutil PO tokens (may get SABR)
+    ["android_sdkless"],       # Last resort: Progressive URLs, often gets 403 with proxies
 ]
 
 # Thread pool for running blocking downloads (8 workers for parallel capacity)
@@ -407,6 +407,58 @@ def _classify_error(error_msg: str) -> Exception:
     if _is_bot_detection_error(error_msg):
         return BotDetectionError(error_msg)  # Special handling - needs longer delays
 
+    # Check for aria2c HTTP errors - these indicate CDN access issues
+    # aria2c exit code 22 = HTTP request was not successful (4xx/5xx)
+    if "aria2c exited with code 22" in error_lower:
+        return CDNAccessError(
+            "aria2c download failed: YouTube CDN returned HTTP error (likely 403 Forbidden). "
+            "This means the download URL was rejected, possibly due to IP mismatch or URL expiration."
+        )
+
+    # Check for explicit HTTP 403/Forbidden errors
+    if "status=403" in error_lower or "403 forbidden" in error_lower:
+        return CDNAccessError(
+            f"YouTube CDN access denied (HTTP 403): {error_msg}"
+        )
+
+    # aria2c exit code 3 = resource not found (404)
+    if "aria2c exited with code 3" in error_lower:
+        return DownloadError(
+            "aria2c download failed: Resource not found (HTTP 404). "
+            "The download URL may have expired. Retrying with fresh URL."
+        )
+
+    # aria2c exit code 6 = network problem
+    if "aria2c exited with code 6" in error_lower:
+        return DownloadError(
+            "aria2c download failed: Network error. "
+            "Connection issue with proxy or YouTube CDN."
+        )
+
+    # aria2c exit code 9 = not enough disk space
+    if "aria2c exited with code 9" in error_lower:
+        return DownloadError(
+            "aria2c download failed: Not enough disk space."
+        )
+
+    # aria2c exit code 24 = HTTP authorization failed
+    if "aria2c exited with code 24" in error_lower:
+        return CDNAccessError(
+            "aria2c download failed: HTTP authorization failed. "
+            "The download URL signature may be invalid."
+        )
+
+    # Generic aria2c errors - provide helpful context
+    if "aria2c exited with code" in error_lower:
+        # Extract the exit code for the message
+        import re
+        match = re.search(r'aria2c exited with code (\d+)', error_lower)
+        exit_code = match.group(1) if match else "unknown"
+        return DownloadError(
+            f"aria2c download failed with exit code {exit_code}. "
+            "External downloader encountered an error. Retrying with fresh connection."
+        )
+
     # Permanent errors - video cannot be downloaded
     if "video unavailable" in error_lower or "removed" in error_lower or "does not exist" in error_lower:
         return VideoUnavailableError(error_msg)
@@ -508,6 +560,8 @@ async def extract_audio_url(
     # Enable Node.js for YouTube bot challenge solving
     if NODEJS_AVAILABLE:
         ydl_opts["js_runtimes"] = {"node": {}}
+        # Enable remote EJS challenge solver for n parameter deobfuscation
+        ydl_opts["remote_components"] = {"ejs:github"}
 
     start_time = time.time()
 
@@ -957,10 +1011,18 @@ async def _download_single_attempt(
     # Enable Node.js for YouTube bot challenge solving
     if NODEJS_AVAILABLE:
         ydl_opts["js_runtimes"] = {"node": {}}
+        # Enable remote EJS challenge solver for n parameter deobfuscation
+        # This is required for web clients to get working download URLs
+        ydl_opts["remote_components"] = {"ejs:github"}
 
     # Use aria2c if available with resume support
-    # Optimized for stability through residential proxies
-    if ARIA2C_AVAILABLE:
+    # IMPORTANT: Disable aria2c when using proxies because:
+    # - YouTube CDN URLs are signed with the requester's IP
+    # - aria2c spawns separate connections that may exit through different IPs
+    # - This causes HTTP 403 errors due to IP mismatch
+    # - yt-dlp's internal downloader maintains the same connection
+    use_aria2c = ARIA2C_AVAILABLE and not proxy_config.get("proxy")
+    if use_aria2c:
         ydl_opts["external_downloader"] = "aria2c"
         aria2c_args = [
             # Reduced parallel connections for better proxy stability
@@ -984,6 +1046,8 @@ async def _download_single_attempt(
         if resume_enabled:
             aria2c_args.extend(["--continue=true", "--auto-file-renaming=false"])
         ydl_opts["external_downloader_args"] = {"aria2c": aria2c_args}
+    elif ARIA2C_AVAILABLE and proxy_config.get("proxy"):
+        logger.debug("aria2c disabled for proxy download (using yt-dlp internal downloader to maintain IP consistency)", "download")
 
     start_time = time.time()
 
@@ -1033,11 +1097,30 @@ async def _download_single_attempt(
 
     except yt_dlp.utils.DownloadError as e:
         error_msg = str(e)
-        # Check if this is a bad proxy symptom and mark the session
-        if is_bad_proxy_symptom(error_msg):
-            mark_session_bad(actual_session_id, "bot_detection" if "bot" in error_msg.lower() else "bad_exit")
-        logger.warn(f"Attempt {attempt} failed: {error_msg[:100]}", "download", {
-            "job_id": job_id, "attempt": attempt, "is_bad_proxy": is_bad_proxy_symptom(error_msg)
+        error_lower = error_msg.lower()
+
+        # Determine the type of error for logging and session marking
+        is_cdn_error = "aria2c exited with code 22" in error_lower or "403" in error_lower
+        is_bot_error = is_bad_proxy_symptom(error_msg)
+
+        # Mark session as bad for CDN errors or bot detection
+        if is_cdn_error:
+            mark_session_bad(actual_session_id, "cdn_403")
+        elif is_bot_error:
+            mark_session_bad(actual_session_id, "bot_detection" if "bot" in error_lower else "bad_exit")
+
+        # Create descriptive error message for logging
+        if is_cdn_error:
+            log_msg = f"Attempt {attempt} failed: YouTube CDN rejected request (HTTP 403 - IP binding issue)"
+        else:
+            log_msg = f"Attempt {attempt} failed: {error_msg[:100]}"
+
+        logger.warn(log_msg, "download", {
+            "job_id": job_id,
+            "attempt": attempt,
+            "is_cdn_error": is_cdn_error,
+            "is_bad_proxy": is_bot_error,
+            "raw_error": error_msg[:200]
         })
         raise _classify_error(error_msg)
 

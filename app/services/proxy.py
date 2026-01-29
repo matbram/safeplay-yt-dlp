@@ -47,6 +47,7 @@ BAD_PROXY_SYMPTOMS = [
     "automated requests",
     "429",  # Rate limited
     "403",  # Forbidden (IP banned)
+    "aria2c exited with code 22",  # HTTP 4xx/5xx - CDN rejected request (IP mismatch)
 ]
 
 
