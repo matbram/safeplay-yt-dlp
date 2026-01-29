@@ -561,6 +561,8 @@ async def extract_audio_url(
     # Enable Node.js for YouTube bot challenge solving
     if NODEJS_AVAILABLE:
         ydl_opts["js_runtimes"] = {"node": {}}
+        # Enable remote EJS challenge solver for n parameter deobfuscation
+        ydl_opts["remote_components"] = {"ejs:github"}
 
     start_time = time.time()
 
@@ -1010,6 +1012,9 @@ async def _download_single_attempt(
     # Enable Node.js for YouTube bot challenge solving
     if NODEJS_AVAILABLE:
         ydl_opts["js_runtimes"] = {"node": {}}
+        # Enable remote EJS challenge solver for n parameter deobfuscation
+        # This is required for web clients to get working download URLs
+        ydl_opts["remote_components"] = {"ejs:github"}
 
     # Use aria2c if available with resume support
     # IMPORTANT: Disable aria2c when using proxies because:
