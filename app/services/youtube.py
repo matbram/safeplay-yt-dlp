@@ -48,6 +48,7 @@ from app.utils.exceptions import (
     DownloadError,
     DownloadTimeoutError,
     BotDetectionError,
+    CDNAccessError,
     PERMANENT_ERRORS,
 )
 
@@ -406,6 +407,58 @@ def _classify_error(error_msg: str) -> Exception:
     # Check for bot detection FIRST - this is retryable with new IP
     if _is_bot_detection_error(error_msg):
         return BotDetectionError(error_msg)  # Special handling - needs longer delays
+
+    # Check for aria2c HTTP errors - these indicate CDN access issues
+    # aria2c exit code 22 = HTTP request was not successful (4xx/5xx)
+    if "aria2c exited with code 22" in error_lower:
+        return CDNAccessError(
+            "aria2c download failed: YouTube CDN returned HTTP error (likely 403 Forbidden). "
+            "This means the download URL was rejected, possibly due to IP mismatch or URL expiration."
+        )
+
+    # Check for explicit HTTP 403/Forbidden errors
+    if "status=403" in error_lower or "403 forbidden" in error_lower:
+        return CDNAccessError(
+            f"YouTube CDN access denied (HTTP 403): {error_msg}"
+        )
+
+    # aria2c exit code 3 = resource not found (404)
+    if "aria2c exited with code 3" in error_lower:
+        return DownloadError(
+            "aria2c download failed: Resource not found (HTTP 404). "
+            "The download URL may have expired. Retrying with fresh URL."
+        )
+
+    # aria2c exit code 6 = network problem
+    if "aria2c exited with code 6" in error_lower:
+        return DownloadError(
+            "aria2c download failed: Network error. "
+            "Connection issue with proxy or YouTube CDN."
+        )
+
+    # aria2c exit code 9 = not enough disk space
+    if "aria2c exited with code 9" in error_lower:
+        return DownloadError(
+            "aria2c download failed: Not enough disk space."
+        )
+
+    # aria2c exit code 24 = HTTP authorization failed
+    if "aria2c exited with code 24" in error_lower:
+        return CDNAccessError(
+            "aria2c download failed: HTTP authorization failed. "
+            "The download URL signature may be invalid."
+        )
+
+    # Generic aria2c errors - provide helpful context
+    if "aria2c exited with code" in error_lower:
+        # Extract the exit code for the message
+        import re
+        match = re.search(r'aria2c exited with code (\d+)', error_lower)
+        exit_code = match.group(1) if match else "unknown"
+        return DownloadError(
+            f"aria2c download failed with exit code {exit_code}. "
+            "External downloader encountered an error. Retrying with fresh connection."
+        )
 
     # Permanent errors - video cannot be downloaded
     if "video unavailable" in error_lower or "removed" in error_lower or "does not exist" in error_lower:
@@ -1033,11 +1086,30 @@ async def _download_single_attempt(
 
     except yt_dlp.utils.DownloadError as e:
         error_msg = str(e)
-        # Check if this is a bad proxy symptom and mark the session
-        if is_bad_proxy_symptom(error_msg):
-            mark_session_bad(actual_session_id, "bot_detection" if "bot" in error_msg.lower() else "bad_exit")
-        logger.warn(f"Attempt {attempt} failed: {error_msg[:100]}", "download", {
-            "job_id": job_id, "attempt": attempt, "is_bad_proxy": is_bad_proxy_symptom(error_msg)
+        error_lower = error_msg.lower()
+
+        # Determine the type of error for logging and session marking
+        is_cdn_error = "aria2c exited with code 22" in error_lower or "403" in error_lower
+        is_bot_error = is_bad_proxy_symptom(error_msg)
+
+        # Mark session as bad for CDN errors or bot detection
+        if is_cdn_error:
+            mark_session_bad(actual_session_id, "cdn_403")
+        elif is_bot_error:
+            mark_session_bad(actual_session_id, "bot_detection" if "bot" in error_lower else "bad_exit")
+
+        # Create descriptive error message for logging
+        if is_cdn_error:
+            log_msg = f"Attempt {attempt} failed: YouTube CDN rejected request (HTTP 403 - IP binding issue)"
+        else:
+            log_msg = f"Attempt {attempt} failed: {error_msg[:100]}"
+
+        logger.warn(log_msg, "download", {
+            "job_id": job_id,
+            "attempt": attempt,
+            "is_cdn_error": is_cdn_error,
+            "is_bad_proxy": is_bot_error,
+            "raw_error": error_msg[:200]
         })
         raise _classify_error(error_msg)
 

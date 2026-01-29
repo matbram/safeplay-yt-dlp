@@ -186,6 +186,24 @@ class RateLimitError(SafePlayError):
         )
 
 
+class CDNAccessError(SafePlayError):
+    """Raised when YouTube CDN rejects the download request (HTTP 403).
+
+    This typically happens when:
+    - The download URL's IP signature doesn't match the downloading IP
+    - The URL has expired
+    - YouTube is blocking the proxy IP
+    """
+
+    def __init__(self, message: str = "CDN access denied (HTTP 403)"):
+        super().__init__(
+            message=message,
+            error_code="CDN_ACCESS_DENIED",
+            retryable=True,
+            user_message="YouTube rejected the download request. Retrying with a fresh connection.",
+        )
+
+
 # =============================================================================
 # ERROR CLASSIFICATION HELPERS
 # =============================================================================
@@ -208,6 +226,7 @@ RETRYABLE_ERRORS = (
     DownloadTimeoutError,
     BotDetectionError,
     RateLimitError,
+    CDNAccessError,
 )
 
 
