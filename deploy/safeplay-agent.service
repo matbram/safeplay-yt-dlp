@@ -12,6 +12,7 @@ WorkingDirectory=/opt/safeplay-ytdlp
 
 # Environment
 EnvironmentFile=/opt/safeplay-ytdlp/.env
+Environment=PYTHONUNBUFFERED=1
 
 # Start the agent
 ExecStart=/opt/safeplay-ytdlp/venv/bin/python -m agent.main
