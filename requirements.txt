@@ -8,3 +8,8 @@ aiofiles>=23.2.1
 python-multipart>=0.0.6
 httpx>=0.26.0
 bgutil-ytdlp-pot-provider>=0.7.0
+aiohttp>=3.9.0
+
+# AI Agent dependencies
+anthropic>=0.40.0
+google-generativeai>=0.8.0

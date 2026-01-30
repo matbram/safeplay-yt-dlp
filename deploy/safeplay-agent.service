@@ -1,0 +1,39 @@
+[Unit]
+Description=SafePlay AI Agent - Self-healing YouTube Downloader Agent
+Documentation=https://github.com/matbram/safeplay-yt-dlp
+After=network.target safeplay-downloader.service
+Wants=safeplay-downloader.service
+
+[Service]
+Type=simple
+User=safeplay
+Group=safeplay
+WorkingDirectory=/home/user/safeplay-yt-dlp
+
+# Environment
+EnvironmentFile=/home/user/safeplay-yt-dlp/.env
+
+# Start the agent
+ExecStart=/home/user/safeplay-yt-dlp/venv/bin/python -m agent.main
+
+# Restart configuration
+Restart=always
+RestartSec=10
+
+# Resource limits
+MemoryMax=512M
+CPUQuota=50%
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=safeplay-agent
+
+# Security hardening
+NoNewPrivileges=false
+ProtectSystem=full
+ProtectHome=read-only
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
