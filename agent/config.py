@@ -29,8 +29,8 @@ class AgentSettings(BaseSettings):
     LLM_PROVIDER: str = "gemini"
 
     # Models to use
-    LLM_MODEL_ANALYSIS: str = "gemini-2.5-flash"  # For quick analysis
-    LLM_MODEL_SYNTHESIS: str = "gemini-2.5-flash-preview-04-17"   # For deeper reasoning
+    LLM_MODEL_ANALYSIS: str = "gemini-2.5-flash"  # For quick analysis (stable)
+    LLM_MODEL_SYNTHESIS: str = "gemini-2.5-flash"   # For deeper reasoning (stable)
 
     # === Downloader Connection ===
     DOWNLOADER_URL: str = "http://localhost:3002"
