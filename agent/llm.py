@@ -512,6 +512,157 @@ Respond with JSON only."""
                 }
             }
 
+    async def analyze_for_optimization(
+        self,
+        success_data: list[dict],
+        failure_data: list[dict],
+        patterns: dict,
+        current_config: dict,
+    ) -> dict:
+        """
+        Analyze all telemetry to recommend proactive optimizations.
+
+        This looks at what's WORKING, not just what's failing, to continuously
+        improve the system.
+        """
+        system_prompt = """You are an optimization expert for the SafePlay YouTube downloader.
+Your job is to analyze both successes AND failures to recommend improvements.
+
+Focus on:
+1. What player clients have the best success rates? Should we prioritize them?
+2. What times of day work best? Any patterns?
+3. What proxy configurations work best?
+4. Are there any quick wins - easy config changes that could improve success?
+5. Are there patterns in what WORKS that we should do more of?
+
+Be data-driven. Don't recommend changes unless the data supports it.
+Only recommend changes with clear evidence of improvement potential.
+
+Respond with valid JSON:
+{
+    "analysis": {
+        "current_success_rate": 0.0-100.0,
+        "potential_success_rate": 0.0-100.0,
+        "key_findings": ["string", "string"],
+        "data_quality": "good|limited|insufficient"
+    },
+    "recommendations": [
+        {
+            "type": "config_change|reorder_clients|schedule_adjustment|no_change",
+            "priority": "high|medium|low",
+            "description": "What to change",
+            "rationale": "Why, with data",
+            "expected_improvement": "What improvement to expect",
+            "config_changes": {"key": "value"} or null,
+            "confidence": 0.0-1.0
+        }
+    ],
+    "learnings": [
+        {
+            "category": "success_pattern|optimization|best_practice",
+            "title": "Short title",
+            "observation": "What we learned from successes",
+            "confidence": 0.0-1.0
+        }
+    ],
+    "should_apply_changes": true/false,
+    "reason": "Why or why not to apply changes"
+}"""
+
+        # Summarize success data
+        success_summary = {
+            "total_successes": len(success_data),
+            "by_player_client": {},
+            "by_hour": {},
+            "avg_duration_ms": 0,
+        }
+
+        total_duration = 0
+        for s in success_data:
+            client = s.get("player_client", "unknown")
+            hour = s.get("hour_of_day", 0)
+            success_summary["by_player_client"][client] = success_summary["by_player_client"].get(client, 0) + 1
+            success_summary["by_hour"][hour] = success_summary["by_hour"].get(hour, 0) + 1
+            if s.get("total_duration_ms"):
+                total_duration += s["total_duration_ms"]
+
+        if success_data:
+            success_summary["avg_duration_ms"] = total_duration // len(success_data)
+
+        # Summarize failure data
+        failure_summary = {
+            "total_failures": len(failure_data),
+            "by_error_code": {},
+            "by_player_client": {},
+        }
+
+        for f in failure_data:
+            code = f.get("error_code", "unknown")
+            client = f.get("player_client", "unknown")
+            failure_summary["by_error_code"][code] = failure_summary["by_error_code"].get(code, 0) + 1
+            failure_summary["by_player_client"][client] = failure_summary["by_player_client"].get(client, 0) + 1
+
+        prompt = f"""Analyze this telemetry data and recommend optimizations.
+
+## Success Summary (what's working)
+```json
+{json.dumps(success_summary, indent=2)}
+```
+
+## Failure Summary (what's not working)
+```json
+{json.dumps(failure_summary, indent=2)}
+```
+
+## Computed Patterns
+```json
+{json.dumps(patterns, indent=2)}
+```
+
+## Current Configuration
+```json
+{json.dumps(current_config, indent=2)}
+```
+
+Based on this data:
+1. What's working well that we should keep doing?
+2. What optimizations could improve success rates?
+3. Should we make any changes now?
+
+Only recommend changes if there's clear data supporting improvement.
+Respond with JSON only."""
+
+        response = await self.generate(
+            prompt=prompt,
+            system_prompt=system_prompt,
+            temperature=0.3,
+            max_tokens=2500,
+        )
+
+        try:
+            content = response.content.strip()
+            if content.startswith("```"):
+                content = content.split("```")[1]
+                if content.startswith("json"):
+                    content = content[4:]
+            content = content.strip()
+
+            result = json.loads(content)
+            result["_llm_metadata"] = {
+                "provider": response.provider,
+                "model": response.model,
+                "tokens_used": response.total_tokens,
+            }
+            return result
+        except json.JSONDecodeError:
+            return {
+                "analysis": {"data_quality": "insufficient"},
+                "recommendations": [],
+                "learnings": [],
+                "should_apply_changes": False,
+                "reason": "Failed to parse optimization analysis",
+            }
+
 
 # Global LLM client instance
 llm_client = LLMClient()

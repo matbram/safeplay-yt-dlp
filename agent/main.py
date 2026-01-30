@@ -77,6 +77,7 @@ class SafePlayAgent:
             asyncio.create_task(self._periodic_pattern_update()),
             asyncio.create_task(self._periodic_journal_update()),
             asyncio.create_task(self._hourly_rate_limit_reset()),
+            asyncio.create_task(self._proactive_optimization()),
         ]
 
         # Start telemetry flushing
@@ -418,6 +419,129 @@ class SafePlayAgent:
                 print(f"Rate limit counters reset. Fix attempts: 0/{runtime_config.max_fix_attempts_per_hour}")
             except asyncio.CancelledError:
                 break
+
+    async def _proactive_optimization(self) -> None:
+        """
+        Periodically analyze ALL telemetry (successes + failures) to find
+        optimizations. This is the continuous learning loop.
+        """
+        # Wait a bit before first run to let data accumulate
+        await asyncio.sleep(300)  # 5 minutes
+
+        while self._running:
+            try:
+                print("[Optimization] Running proactive optimization analysis...")
+
+                # Get all recent telemetry
+                telemetry = await self.telemetry.get_all_recent_telemetry(
+                    limit=500,
+                    hours=24
+                )
+
+                successes = telemetry["successes"]
+                failures = telemetry["failures"]
+                total = telemetry["total"]
+
+                print(f"[Optimization] Analyzing {total} downloads: {len(successes)} successes, {len(failures)} failures")
+
+                if total < 10:
+                    print("[Optimization] Not enough data for meaningful analysis, skipping")
+                    await asyncio.sleep(1800)  # Try again in 30 minutes
+                    continue
+
+                # Get patterns and current config
+                patterns = await self.patterns.get_cached_patterns()
+                current_config = await self.monitor.get_current_config()
+
+                # Check if we can call LLM
+                if not agent_state.can_call_llm():
+                    print("[Optimization] LLM rate limit reached, skipping")
+                    await asyncio.sleep(1800)
+                    continue
+
+                # Analyze for optimizations
+                analysis = await llm_client.analyze_for_optimization(
+                    success_data=successes,
+                    failure_data=failures,
+                    patterns=patterns,
+                    current_config=current_config,
+                )
+
+                # Log analysis results
+                data_quality = analysis.get("analysis", {}).get("data_quality", "unknown")
+                key_findings = analysis.get("analysis", {}).get("key_findings", [])
+                recommendations = analysis.get("recommendations", [])
+                learnings = analysis.get("learnings", [])
+
+                print(f"[Optimization] Data quality: {data_quality}")
+                if key_findings:
+                    print(f"[Optimization] Key findings: {', '.join(key_findings[:3])}")
+
+                # Store learnings from successes
+                for learning in learnings:
+                    if learning.get("confidence", 0) > 0.6:
+                        entry = KnowledgeEntry(
+                            category=learning.get("category", "success_pattern"),
+                            title=learning.get("title", "Untitled"),
+                            observation=learning.get("observation", ""),
+                            confidence=learning.get("confidence", 0.6),
+                            tags=["auto-optimization", "success-based"],
+                        )
+                        entry_id = await self.knowledge.add(entry)
+                        print(f"[Optimization] Added learning: {learning.get('title')}")
+
+                # Apply high-confidence recommendations if flagged
+                if analysis.get("should_apply_changes") and recommendations:
+                    for rec in recommendations:
+                        if rec.get("priority") == "high" and rec.get("confidence", 0) > 0.7:
+                            config_changes = rec.get("config_changes")
+                            if config_changes:
+                                print(f"[Optimization] Applying: {rec.get('description')}")
+                                success = await self.monitor.update_config(config_changes)
+                                if success:
+                                    print(f"[Optimization] Config updated successfully")
+                                    await self.alerts.send(Alert(
+                                        severity="info",
+                                        alert_type="proactive_optimization",
+                                        title="Proactive Optimization Applied",
+                                        message=rec.get("description", "Configuration optimized"),
+                                        details={
+                                            "rationale": rec.get("rationale"),
+                                            "expected_improvement": rec.get("expected_improvement"),
+                                            "config_changes": config_changes,
+                                        }
+                                    ))
+
+                                    # Log the action
+                                    await self.fixer.log_action(
+                                        trigger_type="proactive_optimization",
+                                        action_type="config_change",
+                                        description=rec.get("description", "Proactive config optimization"),
+                                        result=type("FixResult", (), {
+                                            "success": True,
+                                            "fix_type": "config_change",
+                                            "details": config_changes,
+                                            "git_commit": None,
+                                            "error": None
+                                        })(),
+                                        llm_metadata=analysis.get("_llm_metadata"),
+                                    )
+                                else:
+                                    print(f"[Optimization] Failed to apply config change")
+                        elif rec.get("type") != "no_change":
+                            # Log recommendation but don't auto-apply
+                            print(f"[Optimization] Recommendation (not auto-applied): {rec.get('description')}")
+                else:
+                    print("[Optimization] No changes recommended at this time")
+
+                # Wait before next optimization cycle (30 minutes default)
+                await asyncio.sleep(1800)
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                print(f"[Optimization] Error: {e}")
+                await asyncio.sleep(600)  # Retry in 10 minutes on error
 
 
 async def main():

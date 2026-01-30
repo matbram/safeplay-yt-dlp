@@ -158,13 +158,56 @@ class TelemetryLogger:
         hours: int = 24
     ) -> list[dict]:
         """Get recent failed downloads."""
+        cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
         response = self.supabase.table("agent_telemetry") \
             .select("*") \
             .eq("success", False) \
+            .gte("created_at", cutoff) \
             .order("created_at", desc=True) \
             .limit(limit) \
             .execute()
-        return response.data
+        return response.data or []
+
+    async def get_recent_successes(
+        self,
+        limit: int = 100,
+        hours: int = 24
+    ) -> list[dict]:
+        """Get recent successful downloads."""
+        cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
+        response = self.supabase.table("agent_telemetry") \
+            .select("*") \
+            .eq("success", True) \
+            .gte("created_at", cutoff) \
+            .order("created_at", desc=True) \
+            .limit(limit) \
+            .execute()
+        return response.data or []
+
+    async def get_all_recent_telemetry(
+        self,
+        limit: int = 200,
+        hours: int = 24
+    ) -> dict:
+        """Get all recent telemetry, separated by success/failure."""
+        cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
+        response = self.supabase.table("agent_telemetry") \
+            .select("*") \
+            .gte("created_at", cutoff) \
+            .order("created_at", desc=True) \
+            .limit(limit) \
+            .execute()
+
+        data = response.data or []
+        successes = [d for d in data if d.get("success")]
+        failures = [d for d in data if not d.get("success")]
+
+        return {
+            "successes": successes,
+            "failures": failures,
+            "total": len(data),
+            "success_rate": (len(successes) / len(data) * 100) if data else 100.0
+        }
 
     async def get_telemetry_for_job(self, job_id: str) -> list[dict]:
         """Get all telemetry entries for a specific job."""
