@@ -159,13 +159,18 @@ class LogMonitor:
         try:
             payload = json.loads(data)
 
-            # Handle different message types
-            if payload.get("type") == "log":
+            # Handle different message types from the downloader
+            msg_type = payload.get("type", "")
+
+            if msg_type == "log":
+                # Single log entry
                 entry = self._parse_log_entry(payload.get("data", {}))
                 if entry:
                     await self._handle_log_entry(entry)
-            elif payload.get("type") == "logs_batch":
-                for log_data in payload.get("data", []):
+            elif msg_type in ("logs", "logs_batch", "update"):
+                # Batch of logs - check both "logs" and "data" keys
+                logs_data = payload.get("logs") or payload.get("data") or []
+                for log_data in logs_data:
                     entry = self._parse_log_entry(log_data)
                     if entry:
                         await self._handle_log_entry(entry)
@@ -221,11 +226,18 @@ class LogMonitor:
 
     async def _handle_log_entry(self, entry: LogEntry) -> None:
         """Handle a log entry."""
+        # Debug: show all error logs
+        if entry.is_error:
+            print(f"[Monitor] Received {entry.level}: {entry.message[:100]}")
+
         if not entry.is_download_failure:
             return
 
+        print(f"[Monitor] FAILURE DETECTED: {entry.message[:100]}")
+
         job_id = entry.job_id
         if not job_id:
+            print(f"[Monitor] No job_id in failure entry, skipping")
             return
 
         # Check cooldown to avoid processing same failure multiple times
