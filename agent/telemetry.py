@@ -5,7 +5,7 @@ Records every download attempt to Supabase for pattern analysis.
 """
 
 import asyncio
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Optional, Any
 from dataclasses import dataclass, asdict
 import json
@@ -178,9 +178,10 @@ class TelemetryLogger:
     async def get_success_rate(self, hours: int = 24) -> dict:
         """Calculate success rate for the given time period."""
         # Query all records in time window
+        cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
         response = self.supabase.table("agent_telemetry") \
             .select("success") \
-            .gte("created_at", f"now() - interval '{hours} hours'") \
+            .gte("created_at", cutoff) \
             .execute()
 
         if not response.data:
@@ -198,10 +199,11 @@ class TelemetryLogger:
 
     async def get_error_distribution(self, hours: int = 24) -> list[dict]:
         """Get distribution of error codes."""
+        cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
         response = self.supabase.table("agent_telemetry") \
             .select("error_code") \
             .eq("success", False) \
-            .gte("created_at", f"now() - interval '{hours} hours'") \
+            .gte("created_at", cutoff) \
             .execute()
 
         if not response.data:

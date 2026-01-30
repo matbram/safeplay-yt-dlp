@@ -85,9 +85,10 @@ class PatternAnalyzer:
 
     async def _fetch_telemetry(self, hours: int = 168) -> list[dict]:
         """Fetch telemetry data for analysis."""
+        cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
         response = self.supabase.table("agent_telemetry") \
             .select("*") \
-            .gte("created_at", f"now() - interval '{hours} hours'") \
+            .gte("created_at", cutoff) \
             .execute()
         return response.data or []
 
@@ -253,10 +254,11 @@ class PatternAnalyzer:
 
     async def _compute_error_frequency(self, hours: int = 168) -> dict:
         """Compute frequency of error codes."""
+        cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
         response = self.supabase.table("agent_telemetry") \
             .select("error_code, error_message") \
             .eq("success", False) \
-            .gte("created_at", f"now() - interval '{hours} hours'") \
+            .gte("created_at", cutoff) \
             .execute()
 
         data = response.data or []
@@ -314,10 +316,13 @@ class PatternAnalyzer:
 
         # Add trend data
         # Compare to previous 24 hours
+        now = datetime.now(timezone.utc)
+        cutoff_48h = (now - timedelta(hours=48)).isoformat()
+        cutoff_24h = (now - timedelta(hours=24)).isoformat()
         prev_response = self.supabase.table("agent_telemetry") \
             .select("success") \
-            .gte("created_at", f"now() - interval '48 hours'") \
-            .lt("created_at", f"now() - interval '24 hours'") \
+            .gte("created_at", cutoff_48h) \
+            .lt("created_at", cutoff_24h) \
             .execute()
 
         prev_data = prev_response.data or []
