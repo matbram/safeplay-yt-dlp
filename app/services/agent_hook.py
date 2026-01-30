@@ -119,7 +119,11 @@ class AgentHook:
         try:
             client = self._get_client()
             if not client:
+                logger.info(f"[AgentHook] Supabase client not available, skipping telemetry", "agent")
                 return
+
+            status = "SUCCESS" if event.success else "FAILURE"
+            logger.info(f"[AgentHook] Emitting telemetry: {status} for {event.youtube_id} (job: {event.job_id})", "agent")
 
             # Build record
             now = datetime.now(timezone.utc)
@@ -155,13 +159,14 @@ class AgentHook:
             async with self._flush_lock:
                 self._buffer.append(record)
 
-                # Flush if buffer is getting large
-                if len(self._buffer) >= 5:
+                # Flush immediately for failures or if buffer has items
+                # This ensures we don't lose telemetry data
+                if not event.success or len(self._buffer) >= 2:
                     await self._flush()
 
         except Exception as e:
             # Never let telemetry errors affect downloads
-            logger.debug(f"Agent hook: Error emitting telemetry: {e}", "agent")
+            logger.warn(f"[AgentHook] Error emitting telemetry: {e}", "agent")
 
     async def _flush(self) -> None:
         """Flush buffered records to Supabase."""
@@ -179,10 +184,10 @@ class AgentHook:
         try:
             # Insert records
             client.table("agent_telemetry").insert(records).execute()
-            logger.debug(f"Agent hook: Flushed {len(records)} telemetry records", "agent")
+            logger.info(f"[AgentHook] ✓ Flushed {len(records)} telemetry records to Supabase", "agent")
         except Exception as e:
-            # Table might not exist yet - that's okay
-            logger.debug(f"Agent hook: Could not flush telemetry: {e}", "agent")
+            # Table might not exist yet - log the error
+            logger.warn(f"[AgentHook] ✗ Could not flush telemetry to Supabase: {e}", "agent")
 
     async def flush(self) -> None:
         """Public method to flush buffer."""

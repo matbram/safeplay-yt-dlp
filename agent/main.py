@@ -51,9 +51,95 @@ class SafePlayAgent:
         self._failure_queue: asyncio.Queue = asyncio.Queue()
         self._current_fix_job: Optional[str] = None
 
+    async def _startup_diagnostics(self) -> None:
+        """Run startup diagnostics to verify everything is working."""
+        print("=" * 50)
+        print("STARTUP DIAGNOSTICS")
+        print("=" * 50)
+
+        # Check Supabase connectivity
+        print("\n[1/4] Checking Supabase connection...")
+        try:
+            # Try to query the agent_telemetry table
+            response = self.supabase.table("agent_telemetry") \
+                .select("id") \
+                .limit(1) \
+                .execute()
+            print("  ✓ Supabase connected")
+            print(f"  ✓ agent_telemetry table exists")
+
+            # Count existing records
+            count_response = self.supabase.table("agent_telemetry") \
+                .select("id", count="exact") \
+                .execute()
+            record_count = count_response.count if hasattr(count_response, 'count') else len(count_response.data or [])
+            print(f"  ✓ Found {record_count} telemetry records")
+        except Exception as e:
+            print(f"  ✗ Supabase error: {e}")
+            print("  NOTE: Make sure the SQL schema has been applied to Supabase!")
+
+        # Check agent_knowledge table
+        print("\n[2/4] Checking knowledge base...")
+        try:
+            response = self.supabase.table("agent_knowledge") \
+                .select("id") \
+                .limit(1) \
+                .execute()
+            print("  ✓ agent_knowledge table exists")
+        except Exception as e:
+            print(f"  ✗ Knowledge table error: {e}")
+
+        # Check downloader API connectivity
+        print("\n[3/4] Checking downloader API connection...")
+        print(f"  Downloader URL: {settings.DOWNLOADER_URL}")
+        print(f"  API Key configured: {'Yes' if settings.DOWNLOADER_API_KEY else 'NO - MISSING!'}")
+
+        try:
+            import aiohttp
+            async with aiohttp.ClientSession() as session:
+                # Try the health endpoint first (no auth required usually)
+                async with session.get(f"{settings.DOWNLOADER_URL}/health", timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                    if resp.status == 200:
+                        print(f"  ✓ Downloader is reachable (health check OK)")
+                    else:
+                        print(f"  ? Health check returned status {resp.status}")
+
+                # Try authenticated endpoint
+                headers = {"X-API-Key": settings.DOWNLOADER_API_KEY}
+                async with session.get(f"{settings.DOWNLOADER_URL}/api/admin/logs?limit=1", headers=headers, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                    if resp.status == 200:
+                        print(f"  ✓ API authentication successful")
+                    elif resp.status == 401:
+                        print(f"  ✗ API authentication FAILED - check DOWNLOADER_API_KEY")
+                    else:
+                        print(f"  ? API returned status {resp.status}")
+        except Exception as e:
+            print(f"  ✗ Could not connect to downloader: {e}")
+
+        # Check LLM provider
+        print("\n[4/4] Checking LLM provider...")
+        print(f"  Provider: {settings.LLM_PROVIDER}")
+        available = llm_client.get_available_providers()
+        if available:
+            print(f"  ✓ Available providers: {', '.join(available)}")
+        else:
+            print("  ✗ NO LLM PROVIDERS CONFIGURED!")
+            print("  Set ANTHROPIC_API_KEY or GOOGLE_API_KEY in .env")
+
+        print("\n" + "=" * 50)
+        print("IMPORTANT: The DOWNLOADER service must be restarted")
+        print("to enable telemetry hooks. Run:")
+        print("  sudo systemctl restart safeplay-downloader")
+        print("=" * 50)
+        print("")
+
     async def start(self) -> None:
         """Start the agent."""
         print("SafePlay AI Agent starting...")
+        print("")
+
+        # Run startup diagnostics
+        await self._startup_diagnostics()
 
         # Load runtime config from database
         await runtime_config.load(self.supabase)

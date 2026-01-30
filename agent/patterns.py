@@ -368,11 +368,12 @@ class PatternAnalyzer:
 
         # Check for error spikes
         errors = await self._compute_error_frequency(hours=1)
-        if errors["total_errors"] > 10:
+        total_errors = errors.get("sample_size", 0)
+        if total_errors > 10:
             anomalies.append({
                 "type": "error_spike",
                 "severity": "warning",
-                "message": f"{errors['total_errors']} errors in the last hour",
+                "message": f"{total_errors} errors in the last hour",
                 "data": errors,
             })
 
