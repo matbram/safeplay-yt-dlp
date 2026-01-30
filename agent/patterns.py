@@ -83,6 +83,14 @@ class PatternAnalyzer:
 
         return patterns
 
+    async def get_cached_patterns(self) -> dict[str, dict]:
+        """Get cached patterns or compute fresh if none exist."""
+        patterns = await self.get_all_latest_patterns()
+        if not patterns:
+            # No cached patterns, compute fresh
+            patterns = await self.compute_all_patterns()
+        return patterns
+
     async def _fetch_telemetry(self, hours: int = 168) -> list[dict]:
         """Fetch telemetry data for analysis."""
         cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
