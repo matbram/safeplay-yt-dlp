@@ -446,11 +446,15 @@ class Fixer:
             record["llm_completion_tokens"] = llm_metadata.get("completion_tokens")
             record["llm_reasoning"] = llm_metadata.get("reasoning")
 
-        response = self.supabase.table("agent_actions").insert(record).execute()
+        try:
+            response = self.supabase.table("agent_actions").insert(record).execute()
 
-        if response.data:
-            return response.data[0]["id"]
-        return ""
+            if response.data:
+                return response.data[0]["id"]
+            return ""
+        except Exception as e:
+            print(f"Warning: Could not log action to database: {e}")
+            return ""
 
     async def check_ytdlp_version(self) -> dict:
         """Check current and latest yt-dlp versions."""

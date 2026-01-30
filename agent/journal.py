@@ -275,13 +275,15 @@ It is automatically generated and updated as the agent learns from experience.
     async def _generate_recent_activity(self) -> str:
         """Generate the recent activity section."""
         # Get recent actions
-        response = self.telemetry.supabase.table("agent_actions") \
-            .select("*") \
-            .order("created_at", desc=True) \
-            .limit(10) \
-            .execute()
-
-        actions = response.data or []
+        try:
+            response = self.telemetry.supabase.table("agent_actions") \
+                .select("*") \
+                .order("created_at", desc=True) \
+                .limit(10) \
+                .execute()
+            actions = response.data or []
+        except Exception:
+            actions = []
 
         lines = ["## Recent Activity", ""]
 

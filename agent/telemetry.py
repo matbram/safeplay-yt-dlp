@@ -266,14 +266,22 @@ class TelemetryLogger:
 
     async def get_player_client_performance(self, hours: int = 168) -> list[dict]:
         """Get performance stats by player client (last 7 days by default)."""
-        response = self.supabase.table("player_client_performance") \
-            .select("*") \
-            .execute()
-        return response.data
+        try:
+            response = self.supabase.table("player_client_performance") \
+                .select("*") \
+                .execute()
+            return response.data or []
+        except Exception:
+            # View might not exist
+            return []
 
     async def get_hourly_pattern(self, days: int = 7) -> list[dict]:
         """Get success rate by hour of day."""
-        response = self.supabase.table("hourly_success_pattern") \
-            .select("*") \
-            .execute()
-        return response.data
+        try:
+            response = self.supabase.table("hourly_success_pattern") \
+                .select("*") \
+                .execute()
+            return response.data or []
+        except Exception:
+            # View might not exist
+            return []

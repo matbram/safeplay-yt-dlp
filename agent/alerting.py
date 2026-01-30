@@ -88,19 +88,26 @@ class AlertManager:
 
     async def _log_to_database(self, alert: Alert) -> str:
         """Log alert to Supabase."""
-        record = alert.to_db_record()
-        response = self.supabase.table("agent_alerts").insert(record).execute()
+        try:
+            record = alert.to_db_record()
+            response = self.supabase.table("agent_alerts").insert(record).execute()
 
-        if response.data:
-            return response.data[0]["id"]
-        return ""
+            if response.data:
+                return response.data[0]["id"]
+            return ""
+        except Exception as e:
+            print(f"Warning: Could not log alert to database: {e}")
+            return ""
 
     async def _update_alert(self, alert_id: str, updates: dict) -> None:
         """Update alert record in database."""
-        self.supabase.table("agent_alerts") \
-            .update(updates) \
-            .eq("id", alert_id) \
-            .execute()
+        try:
+            self.supabase.table("agent_alerts") \
+                .update(updates) \
+                .eq("id", alert_id) \
+                .execute()
+        except Exception as e:
+            print(f"Warning: Could not update alert in database: {e}")
 
     def _email_configured(self) -> bool:
         """Check if email is configured."""
@@ -378,13 +385,16 @@ Alert ID: {alert_id}
 
     async def get_unacknowledged(self, limit: int = 50) -> list[dict]:
         """Get unacknowledged alerts."""
-        response = self.supabase.table("agent_alerts") \
-            .select("*") \
-            .eq("acknowledged", False) \
-            .order("created_at", desc=True) \
-            .limit(limit) \
-            .execute()
-        return response.data or []
+        try:
+            response = self.supabase.table("agent_alerts") \
+                .select("*") \
+                .eq("acknowledged", False) \
+                .order("created_at", desc=True) \
+                .limit(limit) \
+                .execute()
+            return response.data or []
+        except Exception:
+            return []
 
     async def acknowledge(self, alert_id: str, acknowledged_by: str = "agent") -> None:
         """Acknowledge an alert."""
