@@ -315,20 +315,26 @@ class PatternAnalyzer:
         success_24h = sum(1 for r in data if r.get("success"))
         success_rate = (success_24h / total_24h) * 100 if total_24h > 0 else 100.0
 
-        # Get active alerts count
-        alerts_response = self.supabase.table("agent_alerts") \
-            .select("id", count="exact") \
-            .eq("status", "active") \
-            .execute()
-        active_alerts = alerts_response.count or 0
+        # Get active alerts count (gracefully handle missing table/column)
+        try:
+            alerts_response = self.supabase.table("agent_alerts") \
+                .select("id", count="exact") \
+                .eq("status", "active") \
+                .execute()
+            active_alerts = alerts_response.count or 0
+        except Exception:
+            active_alerts = 0
 
-        # Get fixes applied in 24h
-        fixes_response = self.supabase.table("agent_actions") \
-            .select("id", count="exact") \
-            .eq("outcome", "success") \
-            .gte("created_at", cutoff_24h) \
-            .execute()
-        fixes_24h = fixes_response.count or 0
+        # Get fixes applied in 24h (gracefully handle missing table)
+        try:
+            fixes_response = self.supabase.table("agent_actions") \
+                .select("id", count="exact") \
+                .eq("outcome", "success") \
+                .gte("created_at", cutoff_24h) \
+                .execute()
+            fixes_24h = fixes_response.count or 0
+        except Exception:
+            fixes_24h = 0
 
         health = {
             "success_rate_24h": round(success_rate, 2),
