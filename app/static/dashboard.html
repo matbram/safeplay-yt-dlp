@@ -1,0 +1,682 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SafePlay Agent Dashboard</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Roboto:wght@300;400;500;700&display=swap" rel="stylesheet">
+    <script>
+        tailwind.config = {
+            theme: {
+                extend: {
+                    colors: {
+                        'yt-black': '#0f0f0f',
+                        'yt-dark': '#181818',
+                        'yt-gray': '#212121',
+                        'yt-light-gray': '#303030',
+                        'yt-text': '#f1f1f1',
+                        'yt-text-secondary': '#aaaaaa',
+                        'yt-red': '#ff0000',
+                        'yt-blue': '#3ea6ff',
+                        'yt-green': '#2ba640',
+                        'yt-yellow': '#ffcc00',
+                    },
+                    fontFamily: {
+                        'roboto': ['Roboto', 'sans-serif'],
+                    }
+                }
+            }
+        }
+    </script>
+    <style>
+        body {
+            font-family: 'Roboto', sans-serif;
+            background-color: #0f0f0f;
+        }
+        .pulse-green { animation: pulse-green 2s infinite; }
+        .pulse-red { animation: pulse-red 2s infinite; }
+        .pulse-yellow { animation: pulse-yellow 2s infinite; }
+        @keyframes pulse-green {
+            0%, 100% { box-shadow: 0 0 0 0 rgba(43, 166, 64, 0.7); }
+            50% { box-shadow: 0 0 0 8px rgba(43, 166, 64, 0); }
+        }
+        @keyframes pulse-red {
+            0%, 100% { box-shadow: 0 0 0 0 rgba(255, 0, 0, 0.7); }
+            50% { box-shadow: 0 0 0 8px rgba(255, 0, 0, 0); }
+        }
+        @keyframes pulse-yellow {
+            0%, 100% { box-shadow: 0 0 0 0 rgba(255, 204, 0, 0.7); }
+            50% { box-shadow: 0 0 0 8px rgba(255, 204, 0, 0); }
+        }
+        .card {
+            background: linear-gradient(145deg, #1a1a1a 0%, #181818 100%);
+            border: 1px solid #303030;
+        }
+        .stat-card {
+            background: linear-gradient(145deg, #212121 0%, #1a1a1a 100%);
+        }
+        .scrollbar-thin::-webkit-scrollbar { width: 6px; }
+        .scrollbar-thin::-webkit-scrollbar-track { background: #181818; }
+        .scrollbar-thin::-webkit-scrollbar-thumb { background: #404040; border-radius: 3px; }
+        .scrollbar-thin::-webkit-scrollbar-thumb:hover { background: #505050; }
+        .log-entry { font-family: 'Monaco', 'Consolas', monospace; font-size: 12px; }
+        .fade-in { animation: fadeIn 0.3s ease-in; }
+        @keyframes fadeIn { from { opacity: 0; transform: translateY(-10px); } to { opacity: 1; transform: translateY(0); } }
+    </style>
+</head>
+<body class="bg-yt-black text-yt-text min-h-screen">
+    <!-- Header -->
+    <header class="bg-yt-dark border-b border-yt-light-gray sticky top-0 z-50">
+        <div class="max-w-7xl mx-auto px-4 py-3 flex items-center justify-between">
+            <div class="flex items-center space-x-4">
+                <div class="flex items-center space-x-2">
+                    <svg class="w-8 h-8 text-yt-red" fill="currentColor" viewBox="0 0 24 24">
+                        <path d="M19.615 3.184c-3.604-.246-11.631-.245-15.23 0-3.897.266-4.356 2.62-4.385 8.816.029 6.185.484 8.549 4.385 8.816 3.6.245 11.626.246 15.23 0 3.897-.266 4.356-2.62 4.385-8.816-.029-6.185-.484-8.549-4.385-8.816zm-10.615 12.816v-8l8 3.993-8 4.007z"/>
+                    </svg>
+                    <span class="text-xl font-medium">SafePlay</span>
+                    <span class="text-yt-text-secondary text-sm">Agent Dashboard</span>
+                </div>
+            </div>
+            <div class="flex items-center space-x-4">
+                <div id="connection-status" class="flex items-center space-x-2">
+                    <div id="ws-indicator" class="w-2 h-2 rounded-full bg-yt-text-secondary"></div>
+                    <span class="text-sm text-yt-text-secondary">Connecting...</span>
+                </div>
+                <div class="text-sm text-yt-text-secondary" id="last-update">--</div>
+            </div>
+        </div>
+    </header>
+
+    <!-- Main Content -->
+    <main class="max-w-7xl mx-auto px-4 py-6">
+        <!-- Status Banner -->
+        <div id="status-banner" class="card rounded-xl p-4 mb-6 flex items-center justify-between">
+            <div class="flex items-center space-x-4">
+                <div id="health-indicator" class="w-4 h-4 rounded-full bg-yt-text-secondary"></div>
+                <div>
+                    <h2 class="text-lg font-medium" id="health-status">Loading...</h2>
+                    <p class="text-sm text-yt-text-secondary" id="health-message">Checking system status...</p>
+                </div>
+            </div>
+            <div class="flex items-center space-x-6">
+                <div class="text-center">
+                    <div class="text-2xl font-bold text-yt-green" id="success-rate">--</div>
+                    <div class="text-xs text-yt-text-secondary">Success Rate</div>
+                </div>
+                <div class="text-center">
+                    <div class="text-2xl font-bold" id="total-downloads">--</div>
+                    <div class="text-xs text-yt-text-secondary">Downloads (24h)</div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Stats Grid -->
+        <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
+            <div class="stat-card rounded-xl p-4 border border-yt-light-gray">
+                <div class="flex items-center justify-between mb-2">
+                    <span class="text-yt-text-secondary text-sm">Successful</span>
+                    <svg class="w-5 h-5 text-yt-green" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"/>
+                    </svg>
+                </div>
+                <div class="text-3xl font-bold text-yt-green" id="stat-success">--</div>
+                <div class="text-xs text-yt-text-secondary mt-1">Last 24 hours</div>
+            </div>
+            <div class="stat-card rounded-xl p-4 border border-yt-light-gray">
+                <div class="flex items-center justify-between mb-2">
+                    <span class="text-yt-text-secondary text-sm">Failed</span>
+                    <svg class="w-5 h-5 text-yt-red" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/>
+                    </svg>
+                </div>
+                <div class="text-3xl font-bold text-yt-red" id="stat-failed">--</div>
+                <div class="text-xs text-yt-text-secondary mt-1">Last 24 hours</div>
+            </div>
+            <div class="stat-card rounded-xl p-4 border border-yt-light-gray">
+                <div class="flex items-center justify-between mb-2">
+                    <span class="text-yt-text-secondary text-sm">Avg Duration</span>
+                    <svg class="w-5 h-5 text-yt-blue" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"/>
+                    </svg>
+                </div>
+                <div class="text-3xl font-bold text-yt-blue" id="stat-duration">--</div>
+                <div class="text-xs text-yt-text-secondary mt-1">Per download</div>
+            </div>
+            <div class="stat-card rounded-xl p-4 border border-yt-light-gray">
+                <div class="flex items-center justify-between mb-2">
+                    <span class="text-yt-text-secondary text-sm">Last Hour</span>
+                    <svg class="w-5 h-5 text-yt-yellow" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z"/>
+                    </svg>
+                </div>
+                <div class="text-3xl font-bold text-yt-yellow" id="stat-last-hour">--</div>
+                <div class="text-xs text-yt-text-secondary mt-1">Downloads</div>
+            </div>
+        </div>
+
+        <!-- Charts Row -->
+        <div class="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-6">
+            <!-- Hourly Chart -->
+            <div class="card rounded-xl p-4">
+                <h3 class="text-lg font-medium mb-4">Hourly Activity (24h)</h3>
+                <div class="h-64">
+                    <canvas id="hourly-chart"></canvas>
+                </div>
+            </div>
+
+            <!-- Player Client Performance -->
+            <div class="card rounded-xl p-4">
+                <h3 class="text-lg font-medium mb-4">Player Client Performance</h3>
+                <div class="h-64">
+                    <canvas id="client-chart"></canvas>
+                </div>
+            </div>
+        </div>
+
+        <!-- Two Column Layout -->
+        <div class="grid grid-cols-1 lg:grid-cols-3 gap-6 mb-6">
+            <!-- Live Log Feed -->
+            <div class="lg:col-span-2 card rounded-xl p-4">
+                <div class="flex items-center justify-between mb-4">
+                    <h3 class="text-lg font-medium">Live Download Feed</h3>
+                    <div class="flex items-center space-x-2">
+                        <div class="w-2 h-2 rounded-full bg-yt-green pulse-green" id="live-indicator"></div>
+                        <span class="text-sm text-yt-text-secondary">Live</span>
+                    </div>
+                </div>
+                <div id="live-feed" class="h-80 overflow-y-auto scrollbar-thin space-y-2">
+                    <div class="text-yt-text-secondary text-sm text-center py-8">Waiting for activity...</div>
+                </div>
+            </div>
+
+            <!-- Connection Status -->
+            <div class="card rounded-xl p-4">
+                <h3 class="text-lg font-medium mb-4">System Status</h3>
+                <div class="space-y-4">
+                    <div class="flex items-center justify-between p-3 bg-yt-gray rounded-lg">
+                        <div class="flex items-center space-x-3">
+                            <svg class="w-5 h-5 text-yt-blue" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 12h14M5 12a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v4a2 2 0 01-2 2M5 12a2 2 0 00-2 2v4a2 2 0 002 2h14a2 2 0 002-2v-4a2 2 0 00-2-2m-2-4h.01M17 16h.01"/>
+                            </svg>
+                            <span>Downloader</span>
+                        </div>
+                        <div class="flex items-center space-x-2" id="status-downloader">
+                            <div class="w-2 h-2 rounded-full bg-yt-green"></div>
+                            <span class="text-sm text-yt-green">Online</span>
+                        </div>
+                    </div>
+                    <div class="flex items-center justify-between p-3 bg-yt-gray rounded-lg">
+                        <div class="flex items-center space-x-3">
+                            <svg class="w-5 h-5 text-yt-blue" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 7v10c0 2.21 3.582 4 8 4s8-1.79 8-4V7M4 7c0 2.21 3.582 4 8 4s8-1.79 8-4M4 7c0-2.21 3.582-4 8-4s8 1.79 8 4"/>
+                            </svg>
+                            <span>Supabase</span>
+                        </div>
+                        <div class="flex items-center space-x-2" id="status-supabase">
+                            <div class="w-2 h-2 rounded-full bg-yt-text-secondary"></div>
+                            <span class="text-sm text-yt-text-secondary">Checking...</span>
+                        </div>
+                    </div>
+                    <div class="flex items-center justify-between p-3 bg-yt-gray rounded-lg">
+                        <div class="flex items-center space-x-3">
+                            <svg class="w-5 h-5 text-yt-blue" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8.111 16.404a5.5 5.5 0 017.778 0M12 20h.01m-7.08-7.071c3.904-3.905 10.236-3.905 14.141 0M1.394 9.393c5.857-5.857 15.355-5.857 21.213 0"/>
+                            </svg>
+                            <span>WebSocket</span>
+                        </div>
+                        <div class="flex items-center space-x-2" id="status-websocket">
+                            <div class="w-2 h-2 rounded-full bg-yt-text-secondary"></div>
+                            <span class="text-sm text-yt-text-secondary">Connecting...</span>
+                        </div>
+                    </div>
+                    <div class="flex items-center justify-between p-3 bg-yt-gray rounded-lg">
+                        <div class="flex items-center space-x-3">
+                            <svg class="w-5 h-5 text-yt-blue" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9.75 17L9 20l-1 1h8l-1-1-.75-3M3 13h18M5 17h14a2 2 0 002-2V5a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z"/>
+                            </svg>
+                            <span>AI Agent</span>
+                        </div>
+                        <div class="flex items-center space-x-2" id="status-agent">
+                            <div class="w-2 h-2 rounded-full bg-yt-text-secondary"></div>
+                            <span class="text-sm text-yt-text-secondary">Unknown</span>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Agent Info -->
+                <div class="mt-6 pt-4 border-t border-yt-light-gray">
+                    <h4 class="text-sm font-medium text-yt-text-secondary mb-3">Agent Configuration</h4>
+                    <div class="space-y-2 text-sm">
+                        <div class="flex justify-between">
+                            <span class="text-yt-text-secondary">LLM Provider</span>
+                            <span class="text-yt-blue" id="agent-llm">Gemini</span>
+                        </div>
+                        <div class="flex justify-between">
+                            <span class="text-yt-text-secondary">Model</span>
+                            <span id="agent-model">gemini-2.5-flash</span>
+                        </div>
+                        <div class="flex justify-between">
+                            <span class="text-yt-text-secondary">Git Branch</span>
+                            <span class="text-yt-yellow" id="agent-branch">agent/auto-fixes</span>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Recent Downloads Table -->
+        <div class="card rounded-xl p-4 mb-6">
+            <h3 class="text-lg font-medium mb-4">Recent Downloads</h3>
+            <div class="overflow-x-auto">
+                <table class="w-full text-sm">
+                    <thead>
+                        <tr class="text-yt-text-secondary border-b border-yt-light-gray">
+                            <th class="text-left py-3 px-2">Time</th>
+                            <th class="text-left py-3 px-2">Video ID</th>
+                            <th class="text-left py-3 px-2">Title</th>
+                            <th class="text-left py-3 px-2">Player Client</th>
+                            <th class="text-left py-3 px-2">Duration</th>
+                            <th class="text-left py-3 px-2">Status</th>
+                        </tr>
+                    </thead>
+                    <tbody id="downloads-table">
+                        <tr>
+                            <td colspan="6" class="text-center py-8 text-yt-text-secondary">Loading...</td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+
+        <!-- Knowledge Base -->
+        <div class="card rounded-xl p-4">
+            <h3 class="text-lg font-medium mb-4">Agent Knowledge Base</h3>
+            <div id="knowledge-base" class="space-y-3">
+                <div class="text-yt-text-secondary text-sm text-center py-8">Loading knowledge entries...</div>
+            </div>
+        </div>
+    </main>
+
+    <!-- Footer -->
+    <footer class="border-t border-yt-light-gray mt-8 py-4">
+        <div class="max-w-7xl mx-auto px-4 text-center text-sm text-yt-text-secondary">
+            SafePlay AI Agent Dashboard &bull; Self-healing YouTube Downloader
+        </div>
+    </footer>
+
+    <script>
+        // Configuration
+        const API_BASE = '';
+        const WS_URL = `ws://${window.location.host}/ws/admin`;
+
+        // State
+        let ws = null;
+        let hourlyChart = null;
+        let clientChart = null;
+        let reconnectAttempts = 0;
+        const maxReconnectAttempts = 10;
+
+        // Initialize on page load
+        document.addEventListener('DOMContentLoaded', () => {
+            initCharts();
+            connectWebSocket();
+            fetchAllData();
+            // Refresh data every 30 seconds
+            setInterval(fetchAllData, 30000);
+        });
+
+        // Initialize Charts
+        function initCharts() {
+            const chartOptions = {
+                responsive: true,
+                maintainAspectRatio: false,
+                plugins: {
+                    legend: { display: false }
+                },
+                scales: {
+                    x: {
+                        grid: { color: '#303030' },
+                        ticks: { color: '#aaa' }
+                    },
+                    y: {
+                        grid: { color: '#303030' },
+                        ticks: { color: '#aaa' }
+                    }
+                }
+            };
+
+            // Hourly Chart
+            const hourlyCtx = document.getElementById('hourly-chart').getContext('2d');
+            hourlyChart = new Chart(hourlyCtx, {
+                type: 'bar',
+                data: {
+                    labels: Array.from({length: 24}, (_, i) => `${i}:00`),
+                    datasets: [{
+                        label: 'Downloads',
+                        data: Array(24).fill(0),
+                        backgroundColor: '#3ea6ff',
+                        borderRadius: 4
+                    }]
+                },
+                options: chartOptions
+            });
+
+            // Client Chart
+            const clientCtx = document.getElementById('client-chart').getContext('2d');
+            clientChart = new Chart(clientCtx, {
+                type: 'doughnut',
+                data: {
+                    labels: ['Loading...'],
+                    datasets: [{
+                        data: [1],
+                        backgroundColor: ['#303030']
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    plugins: {
+                        legend: {
+                            position: 'right',
+                            labels: { color: '#f1f1f1' }
+                        }
+                    }
+                }
+            });
+        }
+
+        // WebSocket Connection
+        function connectWebSocket() {
+            ws = new WebSocket(WS_URL);
+
+            ws.onopen = () => {
+                console.log('WebSocket connected');
+                reconnectAttempts = 0;
+                updateConnectionStatus('websocket', true);
+                updateWsIndicator(true);
+            };
+
+            ws.onmessage = (event) => {
+                try {
+                    const data = JSON.parse(event.data);
+                    handleWsMessage(data);
+                } catch (e) {
+                    console.error('Failed to parse WS message:', e);
+                }
+            };
+
+            ws.onclose = () => {
+                console.log('WebSocket closed');
+                updateConnectionStatus('websocket', false);
+                updateWsIndicator(false);
+
+                // Reconnect with exponential backoff
+                if (reconnectAttempts < maxReconnectAttempts) {
+                    const delay = Math.min(1000 * Math.pow(2, reconnectAttempts), 30000);
+                    reconnectAttempts++;
+                    setTimeout(connectWebSocket, delay);
+                }
+            };
+
+            ws.onerror = (error) => {
+                console.error('WebSocket error:', error);
+            };
+        }
+
+        function handleWsMessage(data) {
+            if (data.type === 'logs' && data.logs) {
+                data.logs.forEach(log => addLogEntry(log));
+            } else if (data.type === 'log' && data.message) {
+                addLogEntry(data);
+            }
+        }
+
+        function addLogEntry(log) {
+            const feed = document.getElementById('live-feed');
+            const entry = document.createElement('div');
+            entry.className = 'log-entry p-2 bg-yt-gray rounded fade-in';
+
+            const level = log.level || 'INFO';
+            const levelColors = {
+                'DEBUG': 'text-yt-text-secondary',
+                'INFO': 'text-yt-blue',
+                'WARN': 'text-yt-yellow',
+                'ERROR': 'text-yt-red',
+                'SUCCESS': 'text-yt-green'
+            };
+
+            const time = new Date().toLocaleTimeString();
+            const color = levelColors[level] || 'text-yt-text';
+            const message = log.message || JSON.stringify(log);
+
+            entry.innerHTML = `
+                <span class="text-yt-text-secondary">[${time}]</span>
+                <span class="${color}">[${level}]</span>
+                <span>${escapeHtml(message.substring(0, 200))}</span>
+            `;
+
+            // Remove placeholder
+            const placeholder = feed.querySelector('.text-center');
+            if (placeholder) placeholder.remove();
+
+            // Add new entry at top
+            feed.insertBefore(entry, feed.firstChild);
+
+            // Keep only last 100 entries
+            while (feed.children.length > 100) {
+                feed.removeChild(feed.lastChild);
+            }
+        }
+
+        function updateConnectionStatus(service, connected) {
+            const el = document.getElementById(`status-${service}`);
+            if (!el) return;
+
+            const dot = el.querySelector('div');
+            const text = el.querySelector('span');
+
+            if (connected) {
+                dot.className = 'w-2 h-2 rounded-full bg-yt-green';
+                text.className = 'text-sm text-yt-green';
+                text.textContent = 'Online';
+            } else {
+                dot.className = 'w-2 h-2 rounded-full bg-yt-red';
+                text.className = 'text-sm text-yt-red';
+                text.textContent = 'Offline';
+            }
+        }
+
+        function updateWsIndicator(connected) {
+            const indicator = document.getElementById('ws-indicator');
+            const status = document.getElementById('connection-status').querySelector('span');
+
+            if (connected) {
+                indicator.className = 'w-2 h-2 rounded-full bg-yt-green pulse-green';
+                status.textContent = 'Connected';
+                status.className = 'text-sm text-yt-green';
+            } else {
+                indicator.className = 'w-2 h-2 rounded-full bg-yt-red';
+                status.textContent = 'Disconnected';
+                status.className = 'text-sm text-yt-red';
+            }
+        }
+
+        // Fetch all data
+        async function fetchAllData() {
+            await Promise.all([
+                fetchHealth(),
+                fetchTelemetrySummary(),
+                fetchHourlyStats(),
+                fetchRecentDownloads(),
+                fetchKnowledge()
+            ]);
+            updateLastUpdate();
+        }
+
+        async function fetchHealth() {
+            try {
+                const res = await fetch(`${API_BASE}/api/dashboard/health`);
+                const data = await res.json();
+
+                const indicator = document.getElementById('health-indicator');
+                const status = document.getElementById('health-status');
+                const message = document.getElementById('health-message');
+                const successRate = document.getElementById('success-rate');
+                const totalDownloads = document.getElementById('total-downloads');
+
+                const colors = {
+                    'healthy': 'bg-yt-green pulse-green',
+                    'degraded': 'bg-yt-yellow pulse-yellow',
+                    'critical': 'bg-yt-red pulse-red',
+                    'unknown': 'bg-yt-text-secondary'
+                };
+
+                indicator.className = `w-4 h-4 rounded-full ${colors[data.status] || colors.unknown}`;
+                status.textContent = data.status === 'healthy' ? 'System Healthy' :
+                                    data.status === 'degraded' ? 'System Degraded' :
+                                    data.status === 'critical' ? 'System Critical' : 'Unknown';
+
+                if (data.metrics) {
+                    successRate.textContent = `${data.metrics.success_rate_24h}%`;
+                    totalDownloads.textContent = data.metrics.total_downloads_24h;
+                    message.textContent = `${data.metrics.successful_downloads_24h} successful, ${data.metrics.failed_downloads_24h} failed`;
+                }
+
+                // Update Supabase status based on whether we got data
+                updateConnectionStatus('supabase', data.status !== 'unknown');
+
+            } catch (e) {
+                console.error('Failed to fetch health:', e);
+            }
+        }
+
+        async function fetchTelemetrySummary() {
+            try {
+                const res = await fetch(`${API_BASE}/api/dashboard/telemetry/summary`);
+                const data = await res.json();
+
+                if (!data.error) {
+                    document.getElementById('stat-success').textContent = data.successful || 0;
+                    document.getElementById('stat-failed').textContent = data.failed || 0;
+                    document.getElementById('stat-duration').textContent = data.avg_duration_ms ?
+                        `${(data.avg_duration_ms / 1000).toFixed(1)}s` : '--';
+                    document.getElementById('stat-last-hour').textContent = data.last_hour?.total || 0;
+
+                    // Update client chart
+                    if (data.by_client && data.by_client.length > 0) {
+                        const colors = ['#3ea6ff', '#ff0000', '#ffcc00', '#2ba640', '#9147ff', '#ff6b6b'];
+                        clientChart.data.labels = data.by_client.map(c => c.client);
+                        clientChart.data.datasets[0].data = data.by_client.map(c => c.total);
+                        clientChart.data.datasets[0].backgroundColor = colors.slice(0, data.by_client.length);
+                        clientChart.update();
+                    }
+                }
+            } catch (e) {
+                console.error('Failed to fetch telemetry summary:', e);
+            }
+        }
+
+        async function fetchHourlyStats() {
+            try {
+                const res = await fetch(`${API_BASE}/api/dashboard/telemetry/hourly`);
+                const data = await res.json();
+
+                if (data.hours && data.hours.length > 0) {
+                    hourlyChart.data.datasets[0].data = data.hours.map(h => h.total);
+                    hourlyChart.update();
+                }
+            } catch (e) {
+                console.error('Failed to fetch hourly stats:', e);
+            }
+        }
+
+        async function fetchRecentDownloads() {
+            try {
+                const res = await fetch(`${API_BASE}/api/dashboard/telemetry/recent?limit=10`);
+                const data = await res.json();
+
+                const tbody = document.getElementById('downloads-table');
+
+                if (data.records && data.records.length > 0) {
+                    tbody.innerHTML = data.records.map(r => {
+                        const time = new Date(r.created_at).toLocaleString();
+                        const duration = r.total_duration_ms ? `${(r.total_duration_ms / 1000).toFixed(1)}s` : '--';
+                        const statusClass = r.success ? 'text-yt-green' : 'text-yt-red';
+                        const status = r.success ? 'Success' : 'Failed';
+
+                        return `
+                            <tr class="border-b border-yt-light-gray hover:bg-yt-gray">
+                                <td class="py-3 px-2 text-yt-text-secondary">${time}</td>
+                                <td class="py-3 px-2 font-mono">${r.youtube_id || '--'}</td>
+                                <td class="py-3 px-2">${escapeHtml((r.video_title || '--').substring(0, 40))}</td>
+                                <td class="py-3 px-2">${r.player_client || '--'}</td>
+                                <td class="py-3 px-2">${duration}</td>
+                                <td class="py-3 px-2 ${statusClass}">${status}</td>
+                            </tr>
+                        `;
+                    }).join('');
+                } else {
+                    tbody.innerHTML = '<tr><td colspan="6" class="text-center py-8 text-yt-text-secondary">No downloads yet</td></tr>';
+                }
+            } catch (e) {
+                console.error('Failed to fetch recent downloads:', e);
+            }
+        }
+
+        async function fetchKnowledge() {
+            try {
+                const res = await fetch(`${API_BASE}/api/dashboard/knowledge?limit=5`);
+                const data = await res.json();
+
+                const container = document.getElementById('knowledge-base');
+
+                if (data.entries && data.entries.length > 0) {
+                    container.innerHTML = data.entries.map(e => {
+                        const confidence = Math.round((e.confidence || 0) * 100);
+                        const confidenceColor = confidence >= 70 ? 'bg-yt-green' :
+                                               confidence >= 40 ? 'bg-yt-yellow' : 'bg-yt-red';
+
+                        return `
+                            <div class="p-4 bg-yt-gray rounded-lg">
+                                <div class="flex items-center justify-between mb-2">
+                                    <span class="font-medium">${escapeHtml(e.title || 'Untitled')}</span>
+                                    <div class="flex items-center space-x-2">
+                                        <div class="h-2 w-24 bg-yt-light-gray rounded-full overflow-hidden">
+                                            <div class="${confidenceColor} h-full rounded-full" style="width: ${confidence}%"></div>
+                                        </div>
+                                        <span class="text-sm text-yt-text-secondary">${confidence}%</span>
+                                    </div>
+                                </div>
+                                <p class="text-sm text-yt-text-secondary">${escapeHtml((e.observation || e.explanation || '--').substring(0, 150))}</p>
+                                <div class="mt-2 flex items-center space-x-2">
+                                    <span class="text-xs px-2 py-1 bg-yt-light-gray rounded">${e.category || 'unknown'}</span>
+                                    <span class="text-xs text-yt-text-secondary">Validated ${e.times_validated || 0} times</span>
+                                </div>
+                            </div>
+                        `;
+                    }).join('');
+                } else {
+                    container.innerHTML = '<div class="text-yt-text-secondary text-sm text-center py-8">No knowledge entries yet. The agent is still learning!</div>';
+                }
+            } catch (e) {
+                console.error('Failed to fetch knowledge:', e);
+            }
+        }
+
+        function updateLastUpdate() {
+            const el = document.getElementById('last-update');
+            el.textContent = `Updated: ${new Date().toLocaleTimeString()}`;
+        }
+
+        function escapeHtml(text) {
+            const div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
+        }
+    </script>
+</body>
+</html>

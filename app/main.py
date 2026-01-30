@@ -1,12 +1,15 @@
 """SafePlay YT-DLP Download Service - Main FastAPI Application."""
 
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
 
 from app.config import settings
-from app.routes import download, status, health, admin, benchmark
+from app.routes import download, status, health, admin, benchmark, dashboard
 
 
 @asynccontextmanager
@@ -66,12 +69,27 @@ app.include_router(status.router)
 app.include_router(health.router)
 app.include_router(admin.router)
 app.include_router(benchmark.router)
+app.include_router(dashboard.router)
+
+# Serve static files
+STATIC_DIR = Path(__file__).parent / "static"
+if STATIC_DIR.exists():
+    app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 
 @app.get("/", include_in_schema=False)
 async def root():
     """Root endpoint redirects to health check."""
     return {"service": "safeplay-downloader", "status": "running"}
+
+
+@app.get("/dashboard", include_in_schema=False)
+async def serve_dashboard():
+    """Serve the agent dashboard."""
+    dashboard_path = STATIC_DIR / "dashboard.html"
+    if dashboard_path.exists():
+        return FileResponse(dashboard_path)
+    return {"error": "Dashboard not found"}
 
 
 if __name__ == "__main__":
