@@ -300,19 +300,43 @@ class PatternAnalyzer:
 
     async def _compute_overall_health(self, hours: int = 24) -> dict:
         """Compute overall system health metrics."""
-        # Use the database function
-        response = self.supabase.rpc("get_agent_health_summary").execute()
+        # Compute health locally instead of using RPC function
+        now = datetime.now(timezone.utc)
+        cutoff_24h = (now - timedelta(hours=24)).isoformat()
 
-        if response.data:
-            health = response.data
-        else:
-            health = {
-                "success_rate_24h": 100.0,
-                "total_downloads_24h": 0,
-                "successful_downloads_24h": 0,
-                "active_alerts": 0,
-                "fixes_applied_24h": 0,
-            }
+        # Get 24h telemetry
+        response = self.supabase.table("agent_telemetry") \
+            .select("success") \
+            .gte("created_at", cutoff_24h) \
+            .execute()
+
+        data = response.data or []
+        total_24h = len(data)
+        success_24h = sum(1 for r in data if r.get("success"))
+        success_rate = (success_24h / total_24h) * 100 if total_24h > 0 else 100.0
+
+        # Get active alerts count
+        alerts_response = self.supabase.table("agent_alerts") \
+            .select("id", count="exact") \
+            .eq("status", "active") \
+            .execute()
+        active_alerts = alerts_response.count or 0
+
+        # Get fixes applied in 24h
+        fixes_response = self.supabase.table("agent_actions") \
+            .select("id", count="exact") \
+            .eq("outcome", "success") \
+            .gte("created_at", cutoff_24h) \
+            .execute()
+        fixes_24h = fixes_response.count or 0
+
+        health = {
+            "success_rate_24h": round(success_rate, 2),
+            "total_downloads_24h": total_24h,
+            "successful_downloads_24h": success_24h,
+            "active_alerts": active_alerts,
+            "fixes_applied_24h": fixes_24h,
+        }
 
         # Add trend data
         # Compare to previous 24 hours
