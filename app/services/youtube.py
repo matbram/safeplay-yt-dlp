@@ -67,17 +67,18 @@ MIN_DOWNLOAD_SPEED_KB = 250  # Minimum acceptable download speed in KB/s (abort 
 
 # === PLAYER CLIENT ROTATION ===
 # Optimized for residential proxy usage (tested with Oxylabs):
-# Key insights from production testing:
-#   - mweb: MOST RELIABLE with proxies - consistently works, avoids SABR
-#   - android_sdkless: Gets CDN 403 with proxies due to IP binding issues
+# Key insights from production testing (Jan 2026):
+#   - ios: BEST with proxies - progressive URLs, avoids SABR, no bot detection
+#   - mweb: Previously reliable but now triggers bot detection with proxies
+#   - android_sdkless: DEPRECATED - yt-dlp skips as "unsupported"
 #   - web_safari/web: Gets SABR-blocked formats ("Requested format not available")
-# Order prioritizes mweb which has proven 100% success rate with proxies
+#   - tv_embedded: Alternative for progressive URLs, low bot detection
+# Order prioritizes ios which provides progressive download URLs without SABR
 PLAYER_CLIENTS = [
-    ["mweb"],                  # BEST with proxies: Mobile web consistently works
-    ["android_sdkless", "mweb"],  # Fallback: Try android with mweb backup
-    ["web_safari"],            # Fallback: Has bgutil PO tokens (may get SABR)
-    ["web"],                   # Standard web - bgutil PO tokens (may get SABR)
-    ["android_sdkless"],       # Last resort: Progressive URLs, often gets 403 with proxies
+    ["ios"],                   # BEST with proxies: Progressive URLs, avoids SABR
+    ["mweb"],                  # Fallback: Mobile web (may trigger bot detection)
+    ["ios", "mweb"],           # Combined: ios primary with mweb backup
+    ["tv_embedded"],           # TV client: Progressive URLs, low bot detection
 ]
 
 # Thread pool for running blocking downloads (8 workers for parallel capacity)
@@ -540,16 +541,17 @@ async def extract_audio_url(
         "extract_flat": False,  # We need full format info with URLs
         # Audio-only - lowest bitrate for smallest files
         # IMPORTANT: Do NOT include 'best' fallback as it includes video
-        "format": "worstaudio[protocol=https]/worstaudio",
+        # Chain of fallbacks: HTTPS worstaudio -> any worstaudio -> m4a bestaudio -> any bestaudio
+        "format": "worstaudio[protocol=https]/worstaudio/bestaudio[ext=m4a]/bestaudio",
         "format_sort": ["abr"],
         "geo_bypass": True,
         "socket_timeout": 30,
         # Prefer English audio track
-        # Use web client to avoid PO token requirements for audio formats
+        # Use ios client for progressive URLs without SABR
         "extractor_args": {
             "youtube": {
                 "lang": ["en", "en-US", "en-GB"],
-                "player_client": ["web"],
+                "player_client": ["ios"],
                 # SABR Prevention - force single-file progressive downloads
                 "skip": ["dash", "hls"],  # Skip DASH/HLS manifests entirely
                 "formats": "missing_pot:skip",  # Skip formats that would require SABR (missing PO token URLs)
@@ -982,7 +984,8 @@ async def _download_single_attempt(
         "outtmpl": str(temp_dir / f"{youtube_id}.%(ext)s"),
         # Audio-only - lowest bitrate for smallest files
         # IMPORTANT: Do NOT include 'best' fallback as it includes video
-        "format": "worstaudio[protocol=https]/worstaudio",
+        # Chain of fallbacks: HTTPS worstaudio -> any worstaudio -> m4a bestaudio -> any bestaudio
+        "format": "worstaudio[protocol=https]/worstaudio/bestaudio[ext=m4a]/bestaudio",
         "format_sort": ["abr"],
         "progress_hooks": [lambda d: _progress_hook(d, job_id)],
         "verbose": True,
@@ -1385,9 +1388,9 @@ async def download_video(youtube_id: str, job_id: str) -> dict:
     job_progress[job_id]["attempt"] = MAX_RETRY_ATTEMPTS + 1
     job_progress[job_id]["status"] = "downloading"
 
-    # Circuit breaker uses the most reliable combination that worked in testing
-    # web_safari + android_sdkless worked well when other clients failed
-    circuit_breaker_client = ["web_safari", "android_sdkless"]
+    # Circuit breaker uses ios client which provides progressive download URLs
+    # and avoids both SABR streaming and bot detection issues
+    circuit_breaker_client = ["ios"]
     # Keep US for speed
     circuit_breaker_country = "US"
 
