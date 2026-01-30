@@ -17,7 +17,7 @@ echo -e "${BLUE}============================================${NC}"
 echo ""
 
 # Configuration
-REPO_PATH="${REPO_PATH:-/home/user/safeplay-yt-dlp}"
+REPO_PATH="${REPO_PATH:-/opt/safeplay-ytdlp}"
 VENV_PATH="${REPO_PATH}/venv"
 SERVICE_USER="${SERVICE_USER:-safeplay}"
 DOWNLOADER_SERVICE="${DOWNLOADER_SERVICE:-safeplay-downloader}"
