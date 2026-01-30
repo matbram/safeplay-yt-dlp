@@ -159,10 +159,9 @@ class AgentHook:
             async with self._flush_lock:
                 self._buffer.append(record)
 
-                # Flush immediately for failures or if buffer has items
+                # Flush immediately for every event
                 # This ensures we don't lose telemetry data
-                if not event.success or len(self._buffer) >= 2:
-                    await self._flush()
+                await self._flush()
 
         except Exception as e:
             # Never let telemetry errors affect downloads
