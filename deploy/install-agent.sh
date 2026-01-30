@@ -20,7 +20,7 @@ echo ""
 REPO_PATH="${REPO_PATH:-/opt/safeplay-ytdlp}"
 VENV_PATH="${REPO_PATH}/venv"
 SERVICE_USER="${SERVICE_USER:-safeplay}"
-DOWNLOADER_SERVICE="${DOWNLOADER_SERVICE:-safeplay-downloader}"
+DOWNLOADER_SERVICE="${DOWNLOADER_SERVICE:-safeplay-ytdlp}"
 
 # Check if running as root for system operations
 check_sudo() {

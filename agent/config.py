@@ -37,7 +37,7 @@ class AgentSettings(BaseSettings):
     DOWNLOADER_API_KEY: str = ""
 
     # === Git Configuration ===
-    GIT_REPO_PATH: str = "/home/user/safeplay-yt-dlp"
+    GIT_REPO_PATH: str = "/opt/safeplay-ytdlp"
     GIT_BRANCH: str = "agent/auto-fixes"
     GIT_AUTO_PUSH: bool = True
     GIT_REMOTE: str = "origin"
@@ -68,11 +68,11 @@ class AgentSettings(BaseSettings):
 
     # === Paths ===
     AGENT_LOG_DIR: str = "/var/log/safeplay-agent"
-    JOURNAL_OUTPUT_PATH: str = "/home/user/safeplay-yt-dlp/docs/YOUTUBE_LEARNINGS.md"
+    JOURNAL_OUTPUT_PATH: str = "/opt/safeplay-ytdlp/docs/YOUTUBE_LEARNINGS.md"
 
     # === Service Restart ===
-    DOWNLOADER_SERVICE_NAME: str = "safeplay-downloader"
-    SUDO_RESTART_COMMAND: str = "sudo systemctl restart safeplay-downloader"
+    DOWNLOADER_SERVICE_NAME: str = "safeplay-ytdlp"
+    SUDO_RESTART_COMMAND: str = "sudo systemctl restart safeplay-ytdlp"
 
     class Config:
         env_file = ".env"

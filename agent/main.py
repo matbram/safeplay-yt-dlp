@@ -129,7 +129,7 @@ class SafePlayAgent:
         print("\n" + "=" * 50)
         print("IMPORTANT: The DOWNLOADER service must be restarted")
         print("to enable telemetry hooks. Run:")
-        print("  sudo systemctl restart safeplay-downloader")
+        print(f"  sudo systemctl restart {settings.DOWNLOADER_SERVICE_NAME}")
         print("=" * 50)
         print("")
 

@@ -1,8 +1,8 @@
 [Unit]
 Description=SafePlay AI Agent - Self-healing YouTube Downloader Agent
 Documentation=https://github.com/matbram/safeplay-yt-dlp
-After=network.target safeplay-downloader.service
-Wants=safeplay-downloader.service
+After=network.target safeplay-ytdlp.service
+Wants=safeplay-ytdlp.service
 
 [Service]
 Type=simple
