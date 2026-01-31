@@ -434,3 +434,151 @@ async def get_system_health():
             "message": str(e),
             "metrics": {}
         }
+
+
+@router.get("/intelligence")
+async def get_intelligence_stats():
+    """Get AI intelligence statistics - shows how smart the agent is getting."""
+    supabase = get_supabase()
+    if not supabase:
+        return {"error": "Supabase not available"}
+
+    try:
+        stats = {
+            "error_fingerprints": {},
+            "fix_correlations": {},
+            "knowledge_health": {},
+            "learning_progress": {},
+        }
+
+        # Error fingerprints - how many unique error types the agent knows about
+        try:
+            fp_response = supabase.table("agent_error_fingerprints") \
+                .select("fingerprint, error_type, occurrence_count, successful_fixes, failed_fixes") \
+                .order("occurrence_count", desc=True) \
+                .limit(20) \
+                .execute()
+
+            fingerprints = fp_response.data or []
+            stats["error_fingerprints"] = {
+                "total": len(fingerprints),
+                "top_errors": [
+                    {
+                        "fingerprint": fp["fingerprint"][:8],
+                        "type": fp.get("error_type", "unknown"),
+                        "occurrences": fp.get("occurrence_count", 0),
+                        "has_fix": len(fp.get("successful_fixes", [])) > 0,
+                    }
+                    for fp in fingerprints[:10]
+                ],
+            }
+        except Exception:
+            stats["error_fingerprints"] = {"total": 0, "top_errors": []}
+
+        # Fix correlations - what fixes work for what errors
+        try:
+            corr_response = supabase.table("agent_fix_correlations") \
+                .select("fix_type, success") \
+                .execute()
+
+            correlations = corr_response.data or []
+
+            # Calculate success rates by fix type
+            fix_stats: dict = {}
+            for corr in correlations:
+                ft = corr.get("fix_type", "unknown")
+                if ft not in fix_stats:
+                    fix_stats[ft] = {"success": 0, "failure": 0, "total": 0}
+                fix_stats[ft]["total"] += 1
+                if corr.get("success"):
+                    fix_stats[ft]["success"] += 1
+                else:
+                    fix_stats[ft]["failure"] += 1
+
+            # Add success rates
+            for ft, data in fix_stats.items():
+                if data["total"] > 0:
+                    data["success_rate"] = round(data["success"] / data["total"] * 100, 1)
+
+            stats["fix_correlations"] = {
+                "total_fixes_tracked": len(correlations),
+                "by_type": fix_stats,
+            }
+        except Exception:
+            stats["fix_correlations"] = {"total_fixes_tracked": 0, "by_type": {}}
+
+        # Knowledge health - how confident is the agent's knowledge
+        try:
+            knowledge_response = supabase.table("agent_knowledge") \
+                .select("confidence, status, category") \
+                .eq("status", "active") \
+                .execute()
+
+            knowledge = knowledge_response.data or []
+
+            by_category: dict = {}
+            total_confidence = 0
+            high_confidence = 0
+
+            for k in knowledge:
+                cat = k.get("category", "unknown")
+                conf = k.get("confidence", 0.5)
+
+                if cat not in by_category:
+                    by_category[cat] = 0
+                by_category[cat] += 1
+
+                total_confidence += conf
+                if conf >= 0.7:
+                    high_confidence += 1
+
+            avg_confidence = total_confidence / len(knowledge) if knowledge else 0
+
+            stats["knowledge_health"] = {
+                "total_entries": len(knowledge),
+                "high_confidence_count": high_confidence,
+                "average_confidence": round(avg_confidence * 100, 1),
+                "by_category": by_category,
+            }
+        except Exception:
+            stats["knowledge_health"] = {"total_entries": 0}
+
+        # Learning progress - recent learning activity
+        try:
+            now = datetime.now(timezone.utc)
+            cutoff_7d = (now - timedelta(days=7)).isoformat()
+
+            recent_knowledge = supabase.table("agent_knowledge") \
+                .select("id, title, category, confidence, created_at") \
+                .gte("created_at", cutoff_7d) \
+                .order("created_at", desc=True) \
+                .limit(10) \
+                .execute()
+
+            recent_actions = supabase.table("agent_actions") \
+                .select("id, action_type, outcome") \
+                .gte("created_at", cutoff_7d) \
+                .execute()
+
+            actions_data = recent_actions.data or []
+            success_count = sum(1 for a in actions_data if a.get("outcome") == "success")
+
+            stats["learning_progress"] = {
+                "new_knowledge_7d": len(recent_knowledge.data or []),
+                "actions_7d": len(actions_data),
+                "successful_fixes_7d": success_count,
+                "recent_learnings": [
+                    {
+                        "title": k.get("title", "Untitled"),
+                        "category": k.get("category", "unknown"),
+                        "confidence": round(k.get("confidence", 0.5) * 100),
+                    }
+                    for k in (recent_knowledge.data or [])[:5]
+                ],
+            }
+        except Exception:
+            stats["learning_progress"] = {"new_knowledge_7d": 0, "actions_7d": 0}
+
+        return stats
+    except Exception as e:
+        return {"error": str(e)}

@@ -22,6 +22,7 @@ from .fixer import Fixer
 from .alerting import AlertManager, Alert
 from .patterns import PatternAnalyzer
 from .journal import JournalGenerator
+from .intelligence import IntelligenceEngine
 
 
 class SafePlayAgent:
@@ -44,6 +45,9 @@ class SafePlayAgent:
         # Monitor and fixer need to be initialized after we have the callback
         self.monitor: Optional[LogMonitor] = None
         self.fixer: Optional[Fixer] = None
+
+        # Intelligence engine (initialized after monitor is created)
+        self.intelligence: Optional[IntelligenceEngine] = None
 
         # Tracking
         self._running = False
@@ -154,6 +158,9 @@ class SafePlayAgent:
         # Initialize fixer
         self.fixer = Fixer(self.monitor, self.supabase)
 
+        # Initialize intelligence engine
+        self.intelligence = IntelligenceEngine(self.supabase, self.monitor)
+
         self._running = True
 
         # Start background tasks
@@ -164,6 +171,7 @@ class SafePlayAgent:
             asyncio.create_task(self._periodic_journal_update()),
             asyncio.create_task(self._hourly_rate_limit_reset()),
             asyncio.create_task(self._proactive_optimization()),
+            asyncio.create_task(self._intelligence_maintenance()),
         ]
 
         # Start telemetry flushing
@@ -249,6 +257,10 @@ class SafePlayAgent:
             return
         self._current_fix_job = job_id
 
+        # Track intelligence context for later
+        intelligence_data = None
+        error_fingerprint = None
+
         try:
             # Gather context
             logs = await self.monitor.get_logs_for_job(job_id)
@@ -257,11 +269,31 @@ class SafePlayAgent:
             system_state = await self.monitor.get_system_state()
             current_config = await self.monitor.get_current_config()
 
+            # Process through intelligence engine for enriched context
+            if self.intelligence:
+                intelligence_data = await self.intelligence.process_failure(
+                    error_message=entry.message,
+                    error_code=entry.error_code,
+                    job_id=job_id,
+                )
+                error_fingerprint = intelligence_data.get("fingerprint")
+
+                # Check if we have a high-confidence historical fix
+                recommended_fix = intelligence_data.get("recommended_fix")
+                if recommended_fix and recommended_fix.get("confidence", 0) >= 0.8:
+                    print(f"[Intelligence] Using historical fix: {recommended_fix['fix_type']} "
+                          f"(confidence: {recommended_fix['confidence']:.0%})")
+
             # Get relevant knowledge
             knowledge_context = await self.knowledge.build_context_string(
                 error_code=entry.error_code,
                 error_message=entry.message,
             )
+
+            # Add intelligence context to knowledge context
+            if self.intelligence and intelligence_data:
+                intelligence_context = self.intelligence.build_llm_context(intelligence_data)
+                knowledge_context = f"{knowledge_context}\n\n{intelligence_context}"
 
             # Analyze with LLM
             if not agent_state.can_call_llm():
@@ -368,6 +400,17 @@ class SafePlayAgent:
                 if knowledge_entry_id:
                     await self.knowledge.validate(knowledge_entry_id, True)
 
+                # Record success in intelligence engine
+                if self.intelligence and error_fingerprint:
+                    await self.intelligence.record_fix_outcome(
+                        error_fingerprint=error_fingerprint,
+                        error_type=diagnosis.get("error_type", "unknown"),
+                        fix_type=result.fix_type,
+                        success=True,
+                        knowledge_id=knowledge_entry_id,
+                    )
+                    print(f"[Intelligence] Recorded successful fix for fingerprint {error_fingerprint[:8]}")
+
             else:
                 print(f"Fix failed: {result.error}")
                 await self.alerts.fix_failed(
@@ -379,6 +422,17 @@ class SafePlayAgent:
                 # Invalidate knowledge if fix didn't work
                 if knowledge_entry_id:
                     await self.knowledge.validate(knowledge_entry_id, False)
+
+                # Record failure in intelligence engine
+                if self.intelligence and error_fingerprint:
+                    await self.intelligence.record_fix_outcome(
+                        error_fingerprint=error_fingerprint,
+                        error_type=diagnosis.get("error_type", "unknown"),
+                        fix_type=result.fix_type,
+                        success=False,
+                        knowledge_id=knowledge_entry_id,
+                    )
+                    print(f"[Intelligence] Recorded failed fix for fingerprint {error_fingerprint[:8]}")
 
         except Exception as e:
             print(f"Error handling failure: {e}")
@@ -628,6 +682,61 @@ class SafePlayAgent:
             except Exception as e:
                 print(f"[Optimization] Error: {e}")
                 await asyncio.sleep(600)  # Retry in 10 minutes on error
+
+    async def _intelligence_maintenance(self) -> None:
+        """
+        Periodic intelligence maintenance tasks.
+
+        - Apply confidence decay to aging knowledge
+        - Clean up stale retry history
+        - Log intelligence statistics
+        """
+        # Wait before first run
+        await asyncio.sleep(3600)  # 1 hour
+
+        while self._running:
+            try:
+                print("[Intelligence] Running maintenance...")
+
+                if self.intelligence:
+                    # Run maintenance
+                    stats = await self.intelligence.periodic_maintenance()
+
+                    decayed = stats.get("decayed_entries", 0)
+                    if decayed > 0:
+                        print(f"[Intelligence] Applied confidence decay to {decayed} knowledge entries")
+
+                    # Log fix statistics
+                    fix_stats = stats.get("fix_statistics", {})
+                    if fix_stats:
+                        total_fixes = sum(s.get("total", 0) for s in fix_stats.values())
+                        avg_success = sum(
+                            s.get("success_rate", 0) * s.get("total", 0)
+                            for s in fix_stats.values()
+                        ) / total_fixes if total_fixes > 0 else 0
+
+                        print(f"[Intelligence] Fix statistics: {total_fixes} total fixes, "
+                              f"{avg_success:.1%} average success rate")
+
+                        # Log top performing fixes
+                        sorted_fixes = sorted(
+                            fix_stats.items(),
+                            key=lambda x: x[1].get("success_rate", 0),
+                            reverse=True
+                        )
+                        for fix_type, data in sorted_fixes[:3]:
+                            if data.get("total", 0) >= 2:
+                                print(f"[Intelligence]   {fix_type}: {data.get('success_rate', 0):.0%} "
+                                      f"({data.get('success', 0)}/{data.get('total', 0)})")
+
+                # Run every 6 hours
+                await asyncio.sleep(6 * 3600)
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                print(f"[Intelligence] Maintenance error: {e}")
+                await asyncio.sleep(3600)  # Retry in 1 hour on error
 
 
 async def main():
