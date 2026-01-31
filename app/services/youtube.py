@@ -1264,6 +1264,7 @@ async def download_video(youtube_id: str, job_id: str) -> dict:
                 "method": "proxy_smart_rotation",
                 "cost": COST_PER_DOWNLOAD,
                 "attempts": attempt,
+                "player_client": player_client,  # Track which client succeeded
             }
 
         except PERMANENT_ERRORS as e:

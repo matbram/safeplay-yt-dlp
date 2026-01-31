@@ -659,7 +659,7 @@
 
         async function fetchKnowledge() {
             try {
-                const res = await fetch(`${API_BASE}/api/dashboard/knowledge?limit=5`);
+                const res = await fetch(`${API_BASE}/api/dashboard/knowledge?limit=10&order_by=created_at`);
                 const data = await res.json();
 
                 const container = document.getElementById('knowledge-base');
@@ -669,6 +669,10 @@
                         const confidence = Math.round((e.confidence || 0) * 100);
                         const confidenceColor = confidence >= 70 ? 'bg-yt-green' :
                                                confidence >= 40 ? 'bg-yt-yellow' : 'bg-yt-red';
+
+                        // Format the timestamp
+                        const createdAt = e.created_at ? new Date(e.created_at) : null;
+                        const timeAgo = createdAt ? formatTimeAgo(createdAt) : 'Unknown';
 
                         return `
                             <div class="p-4 bg-yt-gray rounded-lg">
@@ -682,9 +686,12 @@
                                     </div>
                                 </div>
                                 <p class="text-sm text-yt-text-secondary">${escapeHtml((e.observation || e.explanation || '--').substring(0, 150))}</p>
-                                <div class="mt-2 flex items-center space-x-2">
-                                    <span class="text-xs px-2 py-1 bg-yt-light-gray rounded">${e.category || 'unknown'}</span>
-                                    <span class="text-xs text-yt-text-secondary">Validated ${e.times_validated || 0} times</span>
+                                <div class="mt-2 flex items-center justify-between">
+                                    <div class="flex items-center space-x-2">
+                                        <span class="text-xs px-2 py-1 bg-yt-light-gray rounded">${e.category || 'unknown'}</span>
+                                        <span class="text-xs text-yt-text-secondary">Validated ${e.times_validated || 0} times</span>
+                                    </div>
+                                    <span class="text-xs text-yt-text-secondary">${timeAgo}</span>
                                 </div>
                             </div>
                         `;
@@ -695,6 +702,20 @@
             } catch (e) {
                 console.error('Failed to fetch knowledge:', e);
             }
+        }
+
+        function formatTimeAgo(date) {
+            const now = new Date();
+            const diffMs = now - date;
+            const diffMins = Math.floor(diffMs / 60000);
+            const diffHours = Math.floor(diffMs / 3600000);
+            const diffDays = Math.floor(diffMs / 86400000);
+
+            if (diffMins < 1) return 'Just now';
+            if (diffMins < 60) return `${diffMins}m ago`;
+            if (diffHours < 24) return `${diffHours}h ago`;
+            if (diffDays < 7) return `${diffDays}d ago`;
+            return date.toLocaleDateString();
         }
 
         function updateLastUpdate() {

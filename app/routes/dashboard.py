@@ -327,8 +327,14 @@ async def get_patterns():
 
 
 @router.get("/knowledge")
-async def get_knowledge(limit: int = 20, min_confidence: float = 0.0):
-    """Get knowledge base entries."""
+async def get_knowledge(limit: int = 20, min_confidence: float = 0.0, order_by: str = "created_at"):
+    """Get knowledge base entries.
+
+    Args:
+        limit: Maximum number of entries to return
+        min_confidence: Minimum confidence threshold
+        order_by: Field to order by - 'created_at' (newest first) or 'confidence' (highest first)
+    """
     supabase = get_supabase()
     if not supabase:
         return {"error": "Supabase not available", "entries": []}
@@ -338,7 +344,7 @@ async def get_knowledge(limit: int = 20, min_confidence: float = 0.0):
             .select("*") \
             .gte("confidence", min_confidence) \
             .neq("status", "deprecated") \
-            .order("confidence", desc=True) \
+            .order(order_by, desc=True) \
             .limit(limit) \
             .execute()
 
