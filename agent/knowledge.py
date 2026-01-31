@@ -11,40 +11,6 @@ from dataclasses import dataclass, asdict, field
 from uuid import UUID
 
 
-# Terms that indicate video-related knowledge (not applicable to audio-only system)
-INVALID_VIDEO_TERMS = [
-    "max_height",
-    "resolution",
-    "1080p", "720p", "480p", "360p", "240p", "144p",
-    "video codec",
-    "video format",
-    "mp4 video",
-    "video quality",
-    "format_preference",  # Old dead config field
-    "bestvideo",
-    "video bitrate",
-]
-
-
-def validate_knowledge_content(content: str) -> tuple[bool, Optional[str]]:
-    """
-    Check if knowledge content is valid for this audio-only system.
-
-    SafePlay downloads AUDIO ONLY, so we filter out video-related knowledge.
-
-    Returns:
-        (is_valid, reason) - reason is None if valid, or explanation if invalid
-    """
-    content_lower = content.lower()
-
-    # Check for invalid video terms
-    for term in INVALID_VIDEO_TERMS:
-        if term.lower() in content_lower:
-            return False, f"Contains video-related term '{term}' - not applicable to audio-only system"
-
-    return True, None
-
-
 @dataclass
 class KnowledgeEntry:
     """A single knowledge entry."""
@@ -251,45 +217,16 @@ class KnowledgeManager:
         return new_id
 
     async def add_from_analysis(self, analysis_result: dict) -> Optional[str]:
-        """Add knowledge from an LLM analysis result.
-
-        Validates knowledge before storing to ensure it's relevant to
-        this audio-only download system.
-        """
+        """Add knowledge from an LLM analysis result."""
         learning = analysis_result.get("learning", {})
 
         if not learning.get("should_document"):
             return None
 
-        # Validate the learning content before storing
-        title = learning.get("title", "Untitled learning")
-        observation = learning.get("observation", "No observation recorded")
-
-        # Check title
-        is_valid, reason = validate_knowledge_content(title)
-        if not is_valid:
-            print(f"[Knowledge] Rejected invalid learning (title): {reason}")
-            return None
-
-        # Check observation
-        is_valid, reason = validate_knowledge_content(observation)
-        if not is_valid:
-            print(f"[Knowledge] Rejected invalid learning (observation): {reason}")
-            return None
-
-        # Also check any solution/fix details
-        solution = learning.get("solution") or ""
-        fix_details = str(analysis_result.get("fix", {}))
-        combined = f"{solution} {fix_details}"
-        is_valid, reason = validate_knowledge_content(combined)
-        if not is_valid:
-            print(f"[Knowledge] Rejected invalid learning (fix): {reason}")
-            return None
-
         entry = KnowledgeEntry(
             category=learning.get("category", "error_pattern"),
-            title=title,
-            observation=observation,
+            title=learning.get("title", "Untitled learning"),
+            observation=learning.get("observation", "No observation recorded"),
             evidence={
                 "analysis": analysis_result.get("diagnosis", {}),
                 "llm_metadata": analysis_result.get("_llm_metadata", {})
@@ -298,7 +235,6 @@ class KnowledgeManager:
             tags=self._extract_tags(analysis_result)
         )
 
-        print(f"[Knowledge] Adding valid learning: {title}")
         return await self.add(entry)
 
     def _extract_tags(self, analysis_result: dict) -> list[str]:
