@@ -38,12 +38,21 @@ logger.set_broadcast_callback(_queue_log_for_broadcast)
 
 
 class YtdlpConfig(BaseModel):
-    """YT-DLP configuration options."""
-    max_height: int = 720
-    format_preference: str = "mp4"
+    """YT-DLP configuration options.
+
+    NOTE: SafePlay downloads AUDIO ONLY (lowest bitrate audio).
+    The format is hardcoded to: worstaudio[protocol=https]/worstaudio/bestaudio[ext=m4a]/bestaudio
+    """
+    # Audio format settings (for reference - actual format is hardcoded in youtube.py)
+    audio_format: str = "worstaudio"  # The system uses lowest bitrate audio
+    audio_quality: str = "lowest"  # Optimized for speed, not quality
+
+    # Retry settings
     retries: int = 3
     fragment_retries: int = 3
     concurrent_fragments: int = 1
+
+    # Network settings
     rate_limit: Optional[str] = None  # e.g., "50M" for 50MB/s
     geo_bypass: bool = True
     no_playlist: bool = True
@@ -64,7 +73,7 @@ async def update_config(config: YtdlpConfig, api_key: str = Depends(verify_api_k
     """Update yt-dlp configuration."""
     global current_config
     current_config = config
-    logger.info(f"Configuration updated: max_height={config.max_height}, format={config.format_preference}", "admin")
+    logger.info(f"Configuration updated: audio_format={config.audio_format}, retries={config.retries}", "admin")
     return current_config
 
 

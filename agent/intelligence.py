@@ -676,6 +676,95 @@ class SuccessPatternTracker:
         return self._client_stats.copy()
 
 
+class KnowledgeValidator:
+    """
+    Validates knowledge entries to filter out incorrect or irrelevant learnings.
+
+    SafePlay is an AUDIO-ONLY downloader, so we filter out video-related patterns.
+    """
+
+    # Terms that indicate video-related knowledge (not applicable to audio-only system)
+    INVALID_VIDEO_TERMS = [
+        "max_height",
+        "resolution",
+        "1080p", "720p", "480p", "360p", "240p", "144p",
+        "video codec",
+        "video format",
+        "mp4 video",
+        "video quality",
+        "format_preference",  # Old dead config field
+        "bestvideo",
+        "video bitrate",
+    ]
+
+    # Valid audio-related terms
+    VALID_AUDIO_TERMS = [
+        "audio",
+        "worstaudio",
+        "bestaudio",
+        "m4a",
+        "webm",
+        "audio bitrate",
+        "audio format",
+        "player_client",
+        "proxy",
+        "bot detection",
+        "rate limit",
+        "nsig",
+        "sig",
+        "cipher",
+        "extraction",
+    ]
+
+    @classmethod
+    def is_valid_knowledge(cls, content: str) -> tuple[bool, Optional[str]]:
+        """
+        Check if knowledge content is valid for this audio-only system.
+
+        Returns:
+            (is_valid, reason) - reason is None if valid, or explanation if invalid
+        """
+        content_lower = content.lower()
+
+        # Check for invalid video terms
+        for term in cls.INVALID_VIDEO_TERMS:
+            if term.lower() in content_lower:
+                return False, f"Contains video-related term '{term}' - not applicable to audio-only system"
+
+        return True, None
+
+    @classmethod
+    def filter_learnings(cls, learnings: list[dict]) -> list[dict]:
+        """
+        Filter a list of learning entries, removing invalid ones.
+
+        Returns only valid learnings and logs filtered items.
+        """
+        valid_learnings = []
+        for learning in learnings:
+            content = learning.get("observation", "") or learning.get("title", "") or ""
+            config = str(learning.get("config", {}))
+
+            # Check content
+            is_valid, reason = cls.is_valid_knowledge(content)
+            if not is_valid:
+                print(f"[KnowledgeValidator] Filtered invalid learning: {reason}")
+                continue
+
+            # Check config
+            is_valid, reason = cls.is_valid_knowledge(config)
+            if not is_valid:
+                print(f"[KnowledgeValidator] Filtered invalid config: {reason}")
+                continue
+
+            valid_learnings.append(learning)
+
+        if len(valid_learnings) < len(learnings):
+            print(f"[KnowledgeValidator] Filtered {len(learnings) - len(valid_learnings)}/{len(learnings)} invalid learnings")
+
+        return valid_learnings
+
+
 class IntelligenceEngine:
     """
     Main intelligence engine that coordinates all learning components.
@@ -690,6 +779,7 @@ class IntelligenceEngine:
         self.retry = SmartRetryManager(supabase_client, monitor)
         self.correlations = FixCorrelationTracker(supabase_client)
         self.success_patterns = SuccessPatternTracker(supabase_client)
+        self.validator = KnowledgeValidator()
 
     async def process_failure(
         self,
