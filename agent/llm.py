@@ -6,6 +6,7 @@ Provides a unified interface for both providers with automatic fallback.
 
 import json
 import asyncio
+import re
 from typing import Optional, Any
 from dataclasses import dataclass
 from abc import ABC, abstractmethod
@@ -203,6 +204,49 @@ class LLMClient:
         """Get list of available provider names."""
         return [name for name, provider in self.providers.items() if provider.is_available()]
 
+    def _extract_json(self, content: str) -> str:
+        """
+        Extract JSON from LLM response that may contain markdown or extra text.
+
+        Handles various formats:
+        - Pure JSON
+        - ```json ... ```
+        - ``` ... ```
+        - JSON with text before/after
+        """
+        content = content.strip()
+
+        # If it already looks like JSON, return it
+        if content.startswith('{') and content.endswith('}'):
+            return content
+
+        # Try to extract from markdown code block
+        if '```' in content:
+            # Find the JSON block
+            # Match ```json or ``` followed by content ending with ```
+            patterns = [
+                r'```json\s*([\s\S]*?)\s*```',  # ```json ... ```
+                r'```\s*([\s\S]*?)\s*```',       # ``` ... ```
+            ]
+            for pattern in patterns:
+                match = re.search(pattern, content)
+                if match:
+                    extracted = match.group(1).strip()
+                    # Verify it looks like JSON
+                    if extracted.startswith('{'):
+                        return extracted
+
+        # Try to find JSON object in the text
+        # Look for first { and last }
+        first_brace = content.find('{')
+        last_brace = content.rfind('}')
+
+        if first_brace != -1 and last_brace != -1 and last_brace > first_brace:
+            return content[first_brace:last_brace + 1]
+
+        # Return original content as fallback
+        return content
+
     async def generate(
         self,
         prompt: str,
@@ -361,14 +405,7 @@ Respond with JSON only, no markdown formatting."""
 
         # Parse the JSON response
         try:
-            # Clean up response if needed (remove markdown code blocks if present)
-            content = response.content.strip()
-            if content.startswith("```"):
-                content = content.split("```")[1]
-                if content.startswith("json"):
-                    content = content[4:]
-            content = content.strip()
-
+            content = self._extract_json(response.content)
             result = json.loads(content)
             result["_llm_metadata"] = {
                 "provider": response.provider,
@@ -485,13 +522,7 @@ Respond with JSON only."""
         )
 
         try:
-            content = response.content.strip()
-            if content.startswith("```"):
-                content = content.split("```")[1]
-                if content.startswith("json"):
-                    content = content[4:]
-            content = content.strip()
-
+            content = self._extract_json(response.content)
             result = json.loads(content)
             result["_llm_metadata"] = {
                 "provider": response.provider,
@@ -499,7 +530,7 @@ Respond with JSON only."""
                 "tokens_used": response.total_tokens,
             }
             return result
-        except json.JSONDecodeError:
+        except json.JSONDecodeError as e:
             return {
                 "insights": [],
                 "knowledge_updates": [],
@@ -507,8 +538,8 @@ Respond with JSON only."""
                 "_llm_metadata": {
                     "provider": response.provider,
                     "model": response.model,
-                    "parse_error": True,
-                    "raw_response": response.content
+                    "parse_error": str(e),
+                    "raw_response": response.content[:500]
                 }
             }
 
@@ -640,13 +671,7 @@ Respond with JSON only."""
         )
 
         try:
-            content = response.content.strip()
-            if content.startswith("```"):
-                content = content.split("```")[1]
-                if content.startswith("json"):
-                    content = content[4:]
-            content = content.strip()
-
+            content = self._extract_json(response.content)
             result = json.loads(content)
             result["_llm_metadata"] = {
                 "provider": response.provider,
@@ -654,13 +679,19 @@ Respond with JSON only."""
                 "tokens_used": response.total_tokens,
             }
             return result
-        except json.JSONDecodeError:
+        except json.JSONDecodeError as e:
             return {
                 "analysis": {"data_quality": "insufficient"},
                 "recommendations": [],
                 "learnings": [],
                 "should_apply_changes": False,
-                "reason": "Failed to parse optimization analysis",
+                "reason": f"Failed to parse optimization analysis: {e}",
+                "_llm_metadata": {
+                    "provider": response.provider,
+                    "model": response.model,
+                    "parse_error": str(e),
+                    "raw_response": response.content[:500]
+                }
             }
 
 

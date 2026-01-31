@@ -512,9 +512,39 @@
                 fetchTelemetrySummary(),
                 fetchHourlyStats(),
                 fetchRecentDownloads(),
-                fetchKnowledge()
+                fetchKnowledge(),
+                fetchAgentStatus()
             ]);
             updateLastUpdate();
+        }
+
+        async function fetchAgentStatus() {
+            try {
+                const res = await fetch(`${API_BASE}/api/dashboard/agent-status`);
+                const data = await res.json();
+
+                const el = document.getElementById('status-agent');
+                if (!el) return;
+
+                const dot = el.querySelector('div');
+                const text = el.querySelector('span');
+
+                if (data.online) {
+                    dot.className = 'w-2 h-2 rounded-full bg-yt-green';
+                    text.className = 'text-sm text-yt-green';
+                    text.textContent = 'Online';
+                } else if (data.reason === 'idle') {
+                    dot.className = 'w-2 h-2 rounded-full bg-yt-yellow';
+                    text.className = 'text-sm text-yt-yellow';
+                    text.textContent = 'Idle';
+                } else {
+                    dot.className = 'w-2 h-2 rounded-full bg-yt-text-secondary';
+                    text.className = 'text-sm text-yt-text-secondary';
+                    text.textContent = 'Offline';
+                }
+            } catch (e) {
+                console.error('Failed to fetch agent status:', e);
+            }
         }
 
         async function fetchHealth() {

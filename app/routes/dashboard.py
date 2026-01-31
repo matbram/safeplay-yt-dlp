@@ -55,18 +55,107 @@ async def get_dashboard_status():
         except Exception:
             pass
 
+    # Check agent status
+    agent_status = await get_agent_status_internal(supabase)
+
     return {
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "connections": {
             "supabase": supabase_connected,
             "downloader": True,  # If this endpoint responds, downloader is up
+            "agent": agent_status.get("online", False),
         },
+        "agent": agent_status,
         "service": {
             "name": "SafePlay YT-DLP",
             "version": "1.0.0",
             "uptime": "running",
         }
     }
+
+
+async def get_agent_status_internal(supabase) -> dict:
+    """Check if the AI agent is online based on recent activity."""
+    if not supabase:
+        return {"online": False, "reason": "supabase_unavailable"}
+
+    try:
+        now = datetime.now(timezone.utc)
+        # Agent is considered online if there's activity in the last 10 minutes
+        cutoff = (now - timedelta(minutes=10)).isoformat()
+
+        # Check for recent agent actions
+        actions_response = supabase.table("agent_actions") \
+            .select("created_at") \
+            .gte("created_at", cutoff) \
+            .order("created_at", desc=True) \
+            .limit(1) \
+            .execute()
+
+        if actions_response.data:
+            return {
+                "online": True,
+                "last_activity": actions_response.data[0]["created_at"],
+                "reason": "recent_action"
+            }
+
+        # Check for recent alerts (agent sends alerts when it starts)
+        alerts_response = supabase.table("agent_alerts") \
+            .select("created_at") \
+            .gte("created_at", cutoff) \
+            .order("created_at", desc=True) \
+            .limit(1) \
+            .execute()
+
+        if alerts_response.data:
+            return {
+                "online": True,
+                "last_activity": alerts_response.data[0]["created_at"],
+                "reason": "recent_alert"
+            }
+
+        # Check for recent patterns (agent computes patterns periodically)
+        patterns_response = supabase.table("agent_patterns") \
+            .select("computed_at") \
+            .gte("computed_at", cutoff) \
+            .order("computed_at", desc=True) \
+            .limit(1) \
+            .execute()
+
+        if patterns_response.data:
+            return {
+                "online": True,
+                "last_activity": patterns_response.data[0]["computed_at"],
+                "reason": "recent_pattern"
+            }
+
+        # No recent activity - check for any activity in last hour
+        cutoff_1h = (now - timedelta(hours=1)).isoformat()
+        any_response = supabase.table("agent_actions") \
+            .select("created_at") \
+            .gte("created_at", cutoff_1h) \
+            .order("created_at", desc=True) \
+            .limit(1) \
+            .execute()
+
+        if any_response.data:
+            return {
+                "online": False,
+                "last_activity": any_response.data[0]["created_at"],
+                "reason": "idle"
+            }
+
+        return {"online": False, "reason": "no_recent_activity"}
+
+    except Exception as e:
+        return {"online": False, "reason": f"error: {str(e)}"}
+
+
+@router.get("/agent-status")
+async def get_agent_status():
+    """Check if the AI agent is online."""
+    supabase = get_supabase()
+    return await get_agent_status_internal(supabase)
 
 
 @router.get("/telemetry/summary")
