@@ -1,6 +1,7 @@
 """Download endpoint for YouTube videos."""
 
 import asyncio
+import time
 from fastapi import APIRouter, HTTPException, Depends, BackgroundTasks
 
 from app.models.schemas import (
@@ -11,6 +12,12 @@ from app.models.schemas import (
     BatchDownloadResultItem,
 )
 from app.services import youtube, storage, logger
+from app.services.agent_hook import (
+    emit_download_success,
+    emit_download_failure,
+    emit_cache_hit,
+    flush_telemetry,
+)
 from app.middleware.auth import verify_api_key
 from app.utils.exceptions import SafePlayError, get_error_response, is_retryable
 
@@ -62,6 +69,8 @@ async def download_video_endpoint(
     Returns:
         DownloadResponse with storage path and video metadata
     """
+    start_time = time.time()
+
     try:
         logger.info(
             f"Download request received: {request.youtube_id}",
@@ -83,6 +92,9 @@ async def download_video_endpoint(
                 }
             )
             youtube.update_job_progress(request.job_id, "completed", 100)
+
+            # Emit cache hit telemetry
+            await emit_cache_hit(request.job_id, request.youtube_id)
 
             return DownloadResponse(
                 status="success",
@@ -159,6 +171,15 @@ async def download_video_endpoint(
         # Schedule cleanup of temp files
         background_tasks.add_task(youtube.cleanup_temp_files, request.job_id)
 
+        # Emit success telemetry
+        duration_ms = int((time.time() - start_time) * 1000)
+        await emit_download_success(
+            job_id=request.job_id,
+            youtube_id=request.youtube_id,
+            duration_ms=duration_ms,
+            result=result,
+        )
+
         return DownloadResponse(
             status="success",
             youtube_id=request.youtube_id,
@@ -172,6 +193,17 @@ async def download_video_endpoint(
     except SafePlayError as e:
         # Handle known errors with full metadata for orchestration
         youtube.update_job_progress(request.job_id, "failed", 0, e.message)
+
+        # Emit failure telemetry
+        duration_ms = int((time.time() - start_time) * 1000)
+        await emit_download_failure(
+            job_id=request.job_id,
+            youtube_id=request.youtube_id,
+            duration_ms=duration_ms,
+            error=e,
+            result={"attempts": 1},
+        )
+
         raise HTTPException(
             status_code=400,
             detail=e.to_dict(),  # Includes error_code, message, retryable, user_message
@@ -184,6 +216,17 @@ async def download_video_endpoint(
     except Exception as e:
         # Handle unexpected errors - assume retryable (might be transient)
         youtube.update_job_progress(request.job_id, "failed", 0, str(e))
+
+        # Emit failure telemetry
+        duration_ms = int((time.time() - start_time) * 1000)
+        await emit_download_failure(
+            job_id=request.job_id,
+            youtube_id=request.youtube_id,
+            duration_ms=duration_ms,
+            error=e,
+            result={"attempts": 1},
+        )
+
         raise HTTPException(
             status_code=500,
             detail=get_error_response(e),  # Standardized error response

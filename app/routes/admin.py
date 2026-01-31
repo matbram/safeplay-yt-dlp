@@ -18,6 +18,11 @@ from app.services.youtube import (
     COST_PER_DOWNLOAD,
 )
 from app.services import logger
+from app.services.download_config import (
+    DownloadConfig,
+    get_config as get_download_config,
+    update_config as update_download_config,
+)
 
 
 router = APIRouter(tags=["admin"])
@@ -37,35 +42,21 @@ def _queue_log_for_broadcast(entry: dict):
 logger.set_broadcast_callback(_queue_log_for_broadcast)
 
 
-class YtdlpConfig(BaseModel):
-    """YT-DLP configuration options."""
-    max_height: int = 720
-    format_preference: str = "mp4"
-    retries: int = 3
-    fragment_retries: int = 3
-    concurrent_fragments: int = 1
-    rate_limit: Optional[str] = None  # e.g., "50M" for 50MB/s
-    geo_bypass: bool = True
-    no_playlist: bool = True
-
-
-# Current yt-dlp config (in-memory, can be persisted to file)
-current_config = YtdlpConfig()
-
-
-@router.get("/api/admin/config", response_model=YtdlpConfig)
+@router.get("/api/admin/config", response_model=DownloadConfig)
 async def get_config(api_key: str = Depends(verify_api_key)):
-    """Get current yt-dlp configuration."""
-    return current_config
+    """Get current download configuration."""
+    return get_download_config()
 
 
-@router.post("/api/admin/config", response_model=YtdlpConfig)
-async def update_config(config: YtdlpConfig, api_key: str = Depends(verify_api_key)):
-    """Update yt-dlp configuration."""
-    global current_config
-    current_config = config
-    logger.info(f"Configuration updated: max_height={config.max_height}, format={config.format_preference}", "admin")
-    return current_config
+@router.post("/api/admin/config", response_model=DownloadConfig)
+async def update_config(config: DownloadConfig, api_key: str = Depends(verify_api_key)):
+    """Update download configuration.
+
+    These settings are used by the youtube.py downloader in real-time.
+    """
+    updated = update_download_config(config.model_dump())
+    logger.info(f"Configuration updated: retries={updated.retries}, fragment_retries={updated.fragment_retries}, geo_bypass={updated.geo_bypass}", "admin")
+    return updated
 
 
 @router.get("/api/admin/logs")
