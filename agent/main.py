@@ -584,6 +584,13 @@ class SafePlayAgent:
 
                 print(f"[Optimization] Analyzing {total} downloads: {len(successes)} successes, {len(failures)} failures")
 
+                # Learn from ALL downloads (successes + failures)
+                if self.intelligence and total > 0:
+                    all_records = successes + failures
+                    learning_stats = await self.intelligence.learn_from_telemetry(all_records)
+                    print(f"[Optimization] Intelligence learned from {learning_stats.get('successes_processed', 0)} successes, "
+                          f"{learning_stats.get('failures_processed', 0)} failures")
+
                 if total < 10:
                     print("[Optimization] Not enough data for meaningful analysis, skipping")
                     await asyncio.sleep(1800)  # Try again in 30 minutes

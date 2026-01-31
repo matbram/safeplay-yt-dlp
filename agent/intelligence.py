@@ -570,6 +570,112 @@ class FixCorrelationTracker:
             return {}
 
 
+class SuccessPatternTracker:
+    """
+    Tracks patterns from SUCCESSFUL downloads.
+
+    Learns what configurations work best for different scenarios.
+    """
+
+    def __init__(self, supabase_client):
+        self.supabase = supabase_client
+        self._client_stats: dict[str, dict] = {}
+
+    async def learn_from_success(
+        self,
+        player_client: str,
+        video_duration_seconds: Optional[int] = None,
+        hour_of_day: Optional[int] = None,
+        file_size_bytes: Optional[int] = None,
+    ) -> None:
+        """Learn from a successful download."""
+        # Update in-memory stats
+        if player_client not in self._client_stats:
+            self._client_stats[player_client] = {
+                "successes": 0,
+                "total_duration": 0,
+                "hours": {},
+            }
+
+        self._client_stats[player_client]["successes"] += 1
+        if video_duration_seconds:
+            self._client_stats[player_client]["total_duration"] += video_duration_seconds
+        if hour_of_day is not None:
+            hour_key = str(hour_of_day)
+            if hour_key not in self._client_stats[player_client]["hours"]:
+                self._client_stats[player_client]["hours"][hour_key] = 0
+            self._client_stats[player_client]["hours"][hour_key] += 1
+
+    async def learn_from_telemetry_batch(self, telemetry_records: list[dict]) -> dict:
+        """
+        Learn patterns from a batch of telemetry records.
+
+        Returns statistics about what was learned.
+        """
+        successes_processed = 0
+        failures_processed = 0
+
+        client_success: dict[str, int] = {}
+        client_failure: dict[str, int] = {}
+        hourly_success: dict[int, int] = {}
+
+        for record in telemetry_records:
+            player_client = record.get("player_client", "unknown")
+            hour = record.get("hour_of_day", 0)
+
+            if record.get("success"):
+                successes_processed += 1
+                client_success[player_client] = client_success.get(player_client, 0) + 1
+                hourly_success[hour] = hourly_success.get(hour, 0) + 1
+
+                # Learn from this success
+                await self.learn_from_success(
+                    player_client=player_client,
+                    video_duration_seconds=record.get("video_duration_seconds"),
+                    hour_of_day=hour,
+                    file_size_bytes=record.get("file_size_bytes"),
+                )
+            else:
+                failures_processed += 1
+                client_failure[player_client] = client_failure.get(player_client, 0) + 1
+
+        # Calculate success rates
+        client_rates = {}
+        all_clients = set(client_success.keys()) | set(client_failure.keys())
+        for client in all_clients:
+            success = client_success.get(client, 0)
+            failure = client_failure.get(client, 0)
+            total = success + failure
+            if total > 0:
+                client_rates[client] = {
+                    "success": success,
+                    "failure": failure,
+                    "total": total,
+                    "rate": success / total,
+                }
+
+        return {
+            "successes_processed": successes_processed,
+            "failures_processed": failures_processed,
+            "client_success_rates": client_rates,
+            "best_hours": sorted(hourly_success.items(), key=lambda x: x[1], reverse=True)[:5],
+        }
+
+    def get_best_client(self) -> Optional[str]:
+        """Get the player client with the highest success count."""
+        if not self._client_stats:
+            return None
+
+        return max(
+            self._client_stats.items(),
+            key=lambda x: x[1]["successes"]
+        )[0]
+
+    def get_client_stats(self) -> dict:
+        """Get all client statistics."""
+        return self._client_stats.copy()
+
+
 class IntelligenceEngine:
     """
     Main intelligence engine that coordinates all learning components.
@@ -578,10 +684,12 @@ class IntelligenceEngine:
     """
 
     def __init__(self, supabase_client, monitor):
+        self.supabase = supabase_client
         self.fingerprints = ErrorFingerprintManager(supabase_client)
         self.confidence = ConfidenceManager(supabase_client)
         self.retry = SmartRetryManager(supabase_client, monitor)
         self.correlations = FixCorrelationTracker(supabase_client)
+        self.success_patterns = SuccessPatternTracker(supabase_client)
 
     async def process_failure(
         self,
@@ -666,6 +774,53 @@ class IntelligenceEngine:
             new_confidence = await self.confidence.reinforce(knowledge_id, success)
             print(f"[Intelligence] Knowledge {knowledge_id[:8]} confidence: {new_confidence:.2f}")
 
+    async def learn_from_telemetry(self, telemetry_records: list[dict]) -> dict:
+        """
+        Learn from a batch of telemetry records (successes AND failures).
+
+        This is how the agent learns from ALL downloads, not just failures.
+        """
+        # Let the success pattern tracker process everything
+        learning_stats = await self.success_patterns.learn_from_telemetry_batch(telemetry_records)
+
+        # Log what we learned
+        if learning_stats["successes_processed"] > 0:
+            best_clients = sorted(
+                learning_stats["client_success_rates"].items(),
+                key=lambda x: x[1]["rate"],
+                reverse=True
+            )[:3]
+            if best_clients:
+                print(f"[Intelligence] Learned from {learning_stats['successes_processed']} successes")
+                for client, stats in best_clients:
+                    print(f"[Intelligence]   {client}: {stats['rate']:.0%} success rate "
+                          f"({stats['success']}/{stats['total']})")
+
+        return learning_stats
+
+    async def get_recommended_config(self) -> dict:
+        """
+        Get recommended configuration based on learned patterns.
+
+        Returns suggested player_client and other settings.
+        """
+        client_stats = self.success_patterns.get_client_stats()
+
+        if not client_stats:
+            return {"has_recommendation": False}
+
+        # Find best performing client
+        best_client = self.success_patterns.get_best_client()
+
+        # Get success rates from recent telemetry
+        recommendations = {
+            "has_recommendation": True,
+            "recommended_player_client": best_client,
+            "client_statistics": client_stats,
+        }
+
+        return recommendations
+
     async def periodic_maintenance(self) -> dict:
         """
         Run periodic intelligence maintenance tasks.
@@ -678,9 +833,13 @@ class IntelligenceEngine:
         # Get fix statistics
         fix_stats = await self.correlations.get_fix_statistics()
 
+        # Get success pattern statistics
+        client_stats = self.success_patterns.get_client_stats()
+
         return {
             "decayed_entries": decayed_count,
             "fix_statistics": fix_stats,
+            "client_statistics": client_stats,
         }
 
     def build_llm_context(self, intelligence_data: dict) -> str:
