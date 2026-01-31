@@ -38,6 +38,7 @@ from app.services.proxy import (
     get_fresh_session_id,
 )
 from app.services import logger
+from app.services.download_config import get_config as get_download_config
 from app.utils.exceptions import (
     VideoUnavailableError,
     PrivateVideoError,
@@ -532,6 +533,9 @@ async def extract_audio_url(
     ytdlp_logger = logger.YtdlpLogger(job_id)
 
     # yt-dlp options for metadata extraction only
+    # Get runtime config (can be updated by agent)
+    dl_config = get_download_config()
+
     ydl_opts = {
         **proxy_config,
         "quiet": False,
@@ -544,8 +548,8 @@ async def extract_audio_url(
         # Chain of fallbacks: HTTPS worstaudio -> any worstaudio -> m4a bestaudio -> any bestaudio
         "format": "worstaudio[protocol=https]/worstaudio/bestaudio[ext=m4a]/bestaudio",
         "format_sort": ["abr"],
-        "geo_bypass": True,
-        "socket_timeout": 30,
+        "geo_bypass": dl_config.geo_bypass,
+        "socket_timeout": dl_config.socket_timeout,
         # Prefer English audio track
         # Use ios client for progressive URLs without SABR
         "extractor_args": {
@@ -976,11 +980,15 @@ async def _download_single_attempt(
     # Create custom logger for yt-dlp
     ytdlp_logger = logger.YtdlpLogger(job_id)
 
+    # Get runtime config (can be updated by agent)
+    dl_config = get_download_config()
+
     # yt-dlp options optimized for SPEED with fail-fast
+    # Config values come from shared config (agent can update these)
     ydl_opts = {
         "proxy": proxy_config.get("proxy"),
-        "socket_timeout": proxy_config.get("socket_timeout", 30),
-        "retries": proxy_config.get("retries", 2),
+        "socket_timeout": dl_config.socket_timeout,
+        "retries": dl_config.retries,
         "outtmpl": str(temp_dir / f"{youtube_id}.%(ext)s"),
         # Audio-only - lowest bitrate for smallest files
         # IMPORTANT: Do NOT include 'best' fallback as it includes video
@@ -990,12 +998,12 @@ async def _download_single_attempt(
         "progress_hooks": [lambda d: _progress_hook(d, job_id)],
         "verbose": True,
         "logger": ytdlp_logger,
-        # Reduced retries for speed - we handle retries at higher level
-        "fragment_retries": 2,
-        "noplaylist": True,
-        "geo_bypass": True,
+        # Retries controlled by config
+        "fragment_retries": dl_config.fragment_retries,
+        "noplaylist": dl_config.no_playlist,
+        "geo_bypass": dl_config.geo_bypass,
         # Speed optimizations
-        "concurrent_fragment_downloads": 8,
+        "concurrent_fragment_downloads": dl_config.concurrent_fragments,
         "buffersize": 1024 * 64,
         "http_chunk_size": 10485760,
         # Prefer English audio track
